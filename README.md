@@ -24,7 +24,10 @@ use purpose tags describing staff workflows versus shoppers, not names like
 
 ## Try it
 
-Requires Python 3.10+, `uv`, and the Pulumi CLI.
+Requires Python 3.10+, `uv`, and the Pulumi CLI. **The live tests and demo also
+require a TypeSafe API key.** Get a key from the [TypeSafe console](https://console.typesafe.ai/)
+and export it as `TYPESAFE_API_KEY` in the shell where you run these commands.
+The offline tests run without an API key.
 
 From the repository root:
 
@@ -43,7 +46,7 @@ gitignored `.env`, load it with `set -a; source .env; set +a`.
 
 Six resources: two EC2 instances, two ingress rules, and two IAM policies.
 Each pair has one intended finding and one intended pass. Nothing is deployed; no AWS account is needed.
-Run from the repository root after the setup above:
+Run from the repository root after the setup above, with `TYPESAFE_API_KEY` still exported:
 
 ```sh
 cd examples/demo
