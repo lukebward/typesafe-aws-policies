@@ -5,9 +5,10 @@ Each case is (policy, resource_type, props, expect_violation). Messages print wi
 """
 import json
 import os
-from types import MappingProxyType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
+from pulumi_policy.proxy import unknown_checking_proxy
 
 import judge
 import policies
@@ -127,7 +128,8 @@ def test_policy_against_live_model(policy_name, resource_type, props, expect_vio
     judge._cache.clear()
     out = []
     name = props.get("name") or props.get("bucket") or props.get("identifier") or "res"
-    args = SimpleNamespace(resource_type=resource_type, props=MappingProxyType(props), name=name, urn="urn::res")
+    args = SimpleNamespace(resource_type=resource_type, props=unknown_checking_proxy(dict(props)), name=name, urn="urn::res",
+                           get_config=lambda: {"ownAccountId": "123456789012"}, not_applicable=lambda reason=None: None)
     BY_NAME[policy_name](args, lambda m, urn=None: out.append(m))
     print(f"\n{policy_name}: {out or 'no violation'}")
     assert bool(out) == expect_violation, out
