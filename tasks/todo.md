@@ -6,7 +6,7 @@
 - [x] __main__.py wiring
 - [x] examples/demo stack, offline preview
 - [x] README
-- [ ] Private GitHub repo, push
+- [x] Private GitHub repo, push
 - [x] Rewrite: code decides exact cases, model gets the gray zone (15 policies)
 - [x] Live run with TYPESAFE_API_KEY (44/44 live cases, demo preview 18 mandatory + 11 advisory violations, all intended)
 
@@ -34,3 +34,19 @@
 - [x] Run preview from `poc/examples/demo`: exit 0, three expected advisory findings.
 
 Review: original implementation files preserved. Tests and POC preview verified; no resources deployed.
+
+## Semantic policy examples
+
+- [x] Replace bucket and queue checks with ingress-description and IAM-purpose checks.
+- [x] Keep the EC2 check; demonstrate intent in purpose tags instead of obvious names.
+- [x] Update the six-resource demo, offline/live cases, and both READMEs.
+- [x] Verify original and POC tests, live judgments, and preview; push to main.
+
+Keep the POC in one implementation file. Support explicit public ingress on
+`aws.vpc.SecurityGroupIngressRule`, JSON documents on `aws.iam.Policy`, and
+explicit public-IP requests on EC2. All findings remain advisory. Code extracts
+network facts and parses IAM statements; Jev compares those facts with prose.
+
+Semantic POC verification: 116 offline tests passed; six live TypeSafe cases
+passed. Preview exited 0 with exactly three advisory findings. Independent
+review found no substantive issues. Implementation remains one file (87 lines).

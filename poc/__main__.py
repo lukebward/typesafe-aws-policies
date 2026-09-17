@@ -1,9 +1,12 @@
+import json
+
 from pulumi_policy import EnforcementLevel, PolicyPack, ResourceValidationPolicy
 from typesafe_sdk import Noul, TypeSafeClient
 
 
-def probability(args, question):
-    state = {"name": args.name, "tags": dict(args.props.get("tags") or {})}
+def probability(args, question, **facts):
+    state = {"name": args.name, "tags": dict(args.props.get("tags") or {}),
+             "description": args.props.get("description"), **facts}
     with TypeSafeClient() as client:
         response = client.system_one(state=state, questions={"q": Noul(instructions=question)})
     return response.nouls["q"].noul
@@ -15,34 +18,48 @@ def internal_resource_not_public(args, report):
     if args.props.get("associatePublicIpAddress") is not True:
         return
     p = probability(args,
-        "Do `name` or `tags` identify an internal component, such as an admin console, "
-        "back-office service, or worker, rather than a public-facing website or API?")
+        "Do `name` or `tags` describe a component intended only for staff or private "
+        "workflows, rather than a service intended for people on the internet?")
     if p >= 0.8:
         report(f"'{args.name}' looks internal but requests a public IP (p={p:.2f}).")
 
 
-def log_and_temp_buckets_have_lifecycle(args, report):
-    if args.resource_type != "aws:s3/bucket:Bucket":
+def sg_rule_matches_description(args, report):
+    if args.resource_type != "aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule":
         return
-    if args.props.get("lifecycleRules"):
+    props = args.props
+    if props.get("cidrIpv4") != "0.0.0.0/0" and props.get("cidrIpv6") != "::/0":
         return
-    p = probability(args,
-        "Do `name` or `tags` indicate logs, exports, scratch data, caches, or build "
-        "artifacts that should expire, rather than durable uploads, documents, or backups?")
-    if p >= 0.8:
-        report(f"'{args.name}' looks temporary but has no lifecycle rules (p={p:.2f}).")
-
-
-def sqs_work_queue_has_dlq(args, report):
-    if args.resource_type != "aws:sqs/queue:Queue":
-        return
-    if args.props.get("redrivePolicy"):
+    if not props.get("description"):
+        report(f"'{args.name}' allows traffic from anywhere but has no description.")
         return
     p = probability(args,
-        "Do `name` or `tags` identify a primary work queue for jobs, tasks, or order "
-        "processing, rather than a dead-letter queue, retry queue, or notification sink?")
+        "Does this ingress rule allow more access than `description` claims? "
+        "Compare the stated audience and traffic with `source_is_anywhere`, "
+        "`protocol`, and `ports`. A claim of staff-only or VPN-only access conflicts "
+        "with an unrestricted source, even when the port matches.",
+        source_is_anywhere=True, protocol=props.get("ipProtocol"),
+        ports=[props.get("fromPort"), props.get("toPort")])
     if p >= 0.8:
-        report(f"'{args.name}' looks like a work queue but has no dead-letter queue (p={p:.2f}).")
+        report(f"'{args.name}' allows more access than its description claims (p={p:.2f}).")
+
+
+def iam_grant_matches_stated_purpose(args, report):
+    if args.resource_type != "aws:iam/policy:Policy":
+        return
+    statements = json.loads(args.props.get("policy") or "{}").get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not any(s.get("Effect") == "Allow" for s in statements):
+        return
+    p = probability(args,
+        "Do the permissions declared in `statements` substantially exceed the purpose "
+        "stated in `name`, `description`, and `tags`? Look for unrelated services or "
+        "write/admin capabilities for a read-only purpose. Consider the listed resources, "
+        "conditions, and deny statements. A Resource wildcard alone is not a mismatch.",
+        statements=statements)
+    if p >= 0.8:
+        report(f"'{args.name}' grants permissions beyond its stated purpose (p={p:.2f}).")
 
 
 POLICIES = [
@@ -53,16 +70,16 @@ POLICIES = [
         validate=internal_resource_not_public,
     ),
     ResourceValidationPolicy(
-        name="log-and-temp-buckets-have-lifecycle",
-        description="Log and temporary S3 buckets should have lifecycle rules.",
+        name="sg-rule-matches-description",
+        description="Public ingress should match its stated audience and traffic.",
         enforcement_level=EnforcementLevel.ADVISORY,
-        validate=log_and_temp_buckets_have_lifecycle,
+        validate=sg_rule_matches_description,
     ),
     ResourceValidationPolicy(
-        name="sqs-work-queue-has-dlq",
-        description="SQS work queues should have a dead-letter queue.",
+        name="iam-grant-matches-stated-purpose",
+        description="IAM permissions should match the policy's stated purpose.",
         enforcement_level=EnforcementLevel.ADVISORY,
-        validate=sqs_work_queue_has_dlq,
+        validate=iam_grant_matches_stated_purpose,
     ),
 ]
 

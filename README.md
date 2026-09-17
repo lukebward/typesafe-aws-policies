@@ -10,8 +10,9 @@ condition that *is* there actually limits who can call is a question for the mod
 ## Start with the POC
 
 For a quick walkthrough, use [`poc/`](poc/README.md): three advisory policies,
-all implemented in one [70-line file](poc/__main__.py), with a six-resource demo.
-It checks internal EC2 instances, temporary S3 buckets, and SQS work queues.
+all implemented in [one file](poc/__main__.py), with a six-resource demo.
+Jev compares ingress rules with their descriptions, IAM permissions with their
+stated purpose, and public EC2 configuration with intended internal use.
 
 The original **16-policy pack remains at the repository root**, with its full
 AWS coverage, audit CLI, tests, and demo. The instructions below describe that
