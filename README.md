@@ -27,43 +27,38 @@ use purpose tags describing staff workflows versus shoppers, not names like
 Requires Python 3.10+, `uv`, and the Pulumi CLI. **The live tests and demo also
 require a TypeSafe API key.** Get a key from the [TypeSafe console](https://console.typesafe.ai/)
 and export it as `TYPESAFE_API_KEY` in the shell where you run these commands.
-The offline tests run without an API key.
 
 From the repository root:
 
 ```sh
-uv venv venv
-uv pip install --python venv/bin/python -r requirements.txt
 export TYPESAFE_API_KEY=your-key
-venv/bin/python -m pytest -q
-RUN_LIVE=1 venv/bin/python -m pytest -q -s -k live
+./preview.sh
 ```
 
-The key stays in your environment. If you already keep it in the repository root’s
-gitignored `.env`, load it with `set -a; source .env; set +a`.
+The script installs Python dependencies, prepares a local Pulumi stack, and
+previews six resources: two EC2 instances, two ingress rules, and two IAM policies.
+Nothing is deployed; no AWS account or Pulumi login is needed. Run the same
+command again whenever you change a policy or demo resource.
 
-## Preview the demo
-
-Six resources: two EC2 instances, two ingress rules, and two IAM policies.
-Each pair has one intended finding and one intended pass. Nothing is deployed; no AWS account is needed.
-Run from the repository root after the setup above, with `TYPESAFE_API_KEY` still exported:
-
-```sh
-cd examples/demo
-uv venv venv
-uv pip install --python venv/bin/python -r requirements.txt
-mkdir -p .pulumi
-export PULUMI_BACKEND_URL="file://$PWD/.pulumi"
-export PULUMI_CONFIG_PASSPHRASE=demo
-unset PULUMI_API PULUMI_ACCESS_TOKEN AWS_PROFILE AWS_SESSION_TOKEN
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
-pulumi stack select dev --create
-pulumi preview --policy-pack ../..
-```
+If your key is in the gitignored `.env`, load it first with
+`set -a; source .env; set +a`.
 
 Expect three findings: `reconciliation`, `staff-portal`, and `metrics-reader`.
 Preview should finish successfully with three advisory findings. The other
 three resources should pass. Model judgments can vary.
+
+## Tests
+
+After running the preview script:
+
+```sh
+venv/bin/python -m pytest -q
+RUN_LIVE=1 venv/bin/python -m pytest -q -s -k live
+```
+
+Offline tests need no API key. Live tests use your exported `TYPESAFE_API_KEY`.
+For tests without previewing, install dependencies with `uv venv venv` followed by
+`uv pip install --python venv/bin/python -r requirements.txt`.
 
 ## POC scope
 
