@@ -1,6 +1,6 @@
 name: typesafe-aws-policies
-version: 0.2.0
-description: AWS good-usage policies where each rule is a plain-English question answered by TypeSafe's Jev model.
+version: 0.3.0
+description: Three AWS policy examples using TypeSafe judgments.
 runtime:
   name: python
   options:

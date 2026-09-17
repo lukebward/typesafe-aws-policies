@@ -1,7 +1,0 @@
-name: typesafe-aws-policies
-version: 0.3.0
-description: Three AWS policy examples using TypeSafe judgments.
-runtime:
-  name: python
-  options:
-    virtualenv: venv

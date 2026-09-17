@@ -1,125 +1,79 @@
-# typesafe-aws-policies
+# TypeSafe AWS policies
 
-A Pulumi CrossGuard policy pack for AWS where each rule is a plain-English question answered by
-[TypeSafe](https://typesafe.ai)'s Jev model.
+A small Pulumi CrossGuard POC: **code checks the configuration, TypeSafe judges the intent.**
+All three policies and the TypeSafe call live in [`__main__.py`](__main__.py).
 
-The idea in one line: **code decides every case it can decide exactly, and the model only gets the
-gray zone.** A wildcard principal with no condition is a violation without any AI call. Whether the
-condition that *is* there actually limits who can call is a question for the model.
+| Policy | Python checks | TypeSafe asks |
+| --- | --- | --- |
+| Internal EC2 instances | Requests a public IP? | Does the name or tags suggest an internal component? |
+| Security-group ingress | Source open to everyone? Extract protocol and ports. | Does that access exceed what the description claims? |
+| IAM policy permissions | Parse statements; any Allow grants? | Do the grants substantially exceed the stated purpose? |
 
-## Start with the POC
+Each question returns the probability of yes. At `p >= 0.8`, Python reports a
+finding. All three policies are advisory so the demo completes. Change a policy's
+`enforcement_level` to `EnforcementLevel.MANDATORY` to block instead.
+Read any validator top to bottom: field check → question → threshold → report.
 
-For a quick walkthrough, use [`poc/`](poc/README.md): three advisory policies,
-all implemented in [one file](poc/__main__.py), with a six-resource demo.
-Jev compares ingress rules with their descriptions, IAM permissions with their
-stated purpose, and public EC2 configuration with intended internal use.
+The ambiguity is in the intended use. Both demo ingress rules allow TCP 443 from
+anywhere, but one promises access restricted to staff on the company VPN while
+the other describes an internet storefront. Both IAM policies claim to read
+CloudWatch metrics, but one also grants write access and control over EC2.
+Jev compares that prose with facts extracted by code. The EC2 examples likewise
+use purpose tags describing staff workflows versus shoppers, not names like
+`internal-server` and `public-server`.
 
-The original **16-policy pack remains at the repository root**, with its full
-AWS coverage, audit CLI, tests, and demo. The instructions below describe that
-full pack; [POC setup and preview instructions](poc/README.md#try-it) are separate.
+## Try it
 
-## How a policy works
+Requires Python 3.10+, `uv`, and the Pulumi CLI.
 
-```
-resource inputs
-      │
-      ▼
- exact checks in code ──── clear violation ───────────────► report
-      │
-      ▼ only the ambiguous residue
- small JSON state + a typed question ──► TypeSafe (~100 ms) ──► probability
-      │
-      ▼
- threshold in code ─────────────────────────────────────────► report or pass
-```
-
-The model never writes text and never decides what to do. It returns a probability (Noul), a pick
-from a fixed set (Choice), or a position on a rubric (Score). Code owns the thresholds.
-
-## Quick start
+From the repository root:
 
 ```sh
-uv venv venv --python 3.13
+uv venv venv
 uv pip install --python venv/bin/python -r requirements.txt
-echo "TYPESAFE_API_KEY=..." > .env        # gitignored; or export the variable
-
-venv/bin/python -m pytest -q test_judge.py test_policies.py test_audit.py   # 93 tests, no network
-venv/bin/python -m pytest -q test_live.py -s                                 # 44 cases against the real model
+export TYPESAFE_API_KEY=your-key
+venv/bin/python -m pytest -q
+RUN_LIVE=1 venv/bin/python -m pytest -q -s -k live
 ```
 
-Run it against any stack from that stack's project directory:
+The key stays in your environment. If you already keep it in the repository root’s
+gitignored `.env`, load it with `set -a; source .env; set +a`.
+
+## Preview the demo
+
+Six resources: two EC2 instances, two ingress rules, and two IAM policies.
+Each pair has one intended finding and one intended pass. Nothing is deployed; no AWS account is needed.
+Run from the repository root after the setup above:
 
 ```sh
-pulumi preview --policy-pack ~/Workspace/Pulumi/typesafe-aws-policies \
-  --policy-pack-config ~/Workspace/Pulumi/typesafe-aws-policies/examples/policy-config.example.json
+cd examples/demo
+uv venv venv
+uv pip install --python venv/bin/python -r requirements.txt
+mkdir -p .pulumi
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"
+export PULUMI_CONFIG_PASSPHRASE=demo
+unset PULUMI_API PULUMI_ACCESS_TOKEN AWS_PROFILE AWS_SESSION_TOKEN
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+pulumi stack select dev --create
+pulumi preview --policy-pack ../..
 ```
 
-Set `ownAccountId` in the config file to the stack's AWS account. Same-account root trust is a common,
-intentional pattern and is then accepted; without the config it shows as an advisory so nothing blocks.
+Expect three findings: `reconciliation`, `staff-portal`, and `metrics-reader`.
+Preview should finish successfully with three advisory findings. The other
+three resources should pass. Model judgments can vary.
 
-## The policies
+## POC scope
 
-| Policy | Resources | Code decides | Model decides |
-| --- | --- | --- | --- |
-| resource-policy-not-open | S3, KMS, SQS, SNS, Secrets Manager policies | wildcard principal with no Condition | does the Condition limit *who* can call, or only *how* |
-| sensitive-data-store-encrypted | S3, RDS, DynamoDB, EBS, EFS | the per-type encryption field | do name, tags, description indicate sensitive data |
-| prod-or-sensitive-store-protected | RDS, S3, DynamoDB | backups, deletion protection, multi-AZ, versioning, PITR | is this production, is this sensitive |
-| iam-no-admin-equivalent | IAM policies | known escalation chains from an action catalog, wildcards and NotAction included | can an unlisted service wildcard plus PassRole run code under a passed role |
-| iam-grant-matches-stated-purpose | IAM policies | none | Score: does the grant match the name and description, go somewhat beyond, or far beyond |
-| iam-trust-policy-restricted | IAM roles (aws, aws-native) | `Principal: *` with no Condition; cross-account root trust when `ownAccountId` is set; service principals and named roles skipped | federated subject breadth (`repo:org/*:*`) and whether conditioned principals are really pinned |
-| iam-trust-account-wide | IAM roles (aws, aws-native) | account-wide root trust without a restricting condition, unless the account is own or trusted | none |
-| iam-no-service-users | IAM users | none | does the user name identify a machine rather than a person |
-| sg-rule-matches-description | security groups, ingress rules | rule is public or broad; missing description | does the rule allow more than its description claims |
-| sg-description-meaningful | security groups | none | Score on description quality |
-| internal-resource-not-public | EC2, RDS, load balancers, Lambda URLs | the per-type public flag | do name, tags, description indicate an internal component |
-| log-and-temp-buckets-have-lifecycle | S3 | lifecycle rules present | is this bucket for logs, exports, scratch, or artifacts |
-| no-plaintext-secrets-in-env | Lambda, ECS task definitions, CodeBuild | value shape computed locally, the value itself never leaves the process | given name and shape, is this a plaintext credential |
-| tags-meaningful | any resource with tags | which tags are present | owner is real, env is recognized, cost center is plausible |
-| name-consistent-with-config | any resource with an env tag | env tag present | does the name imply a different environment than the tag |
-| sqs-work-queue-has-dlq | SQS queues | redrive policy present | is this a primary work queue rather than a DLQ or fan-out sink |
+This demonstrates intent checks, not comprehensive AWS security coverage. The
+model sees logical names, tags, descriptions, and the relevant network facts or
+IAM statements.
 
-Security policies are MANDATORY. Hygiene policies (purpose fit, names, descriptions, tags, IAM users,
-lifecycle, DLQ, account-wide trust) are ADVISORY. Set `"all": {"enforcementLevel": "advisory"}` in
-the config file to start advisory-only.
+- EC2 checks explicit public-IP requests, not effective network reachability.
+- Ingress checks standalone `aws.vpc.SecurityGroupIngressRule` resources whose
+  source is `0.0.0.0/0` or `::/0`. Missing descriptions are reported without AI.
+  Other CIDRs and inline security-group rules are outside this POC's scope.
+- IAM checks JSON policy documents on `aws.iam.Policy`. It compares declared
+  grants with stated purpose; it does not simulate effective AWS permissions.
 
-## Reading the code
-
-- `policies.py` is the whole pack. Each policy is one short function under an `@policy(...)` decorator
-  that names it, sets enforcement and severity, and lists the resource types it applies to. The
-  question the policy asks sits right above it as a `Q_*` constant, so tuning a question is a one-line
-  edit and the function body reads as plain logic.
-- `judge.py` is the only file that talks to TypeSafe: the API key, an in-process cache, `noul` for one
-  question, `noul_each` for one question over every item in a list, the shared environment Choice,
-  and `value_shape`, which describes a string without revealing it.
-- `audit.py` runs every policy over `pulumi stack export` output and prints each verdict, passes
-  included, because a preview only shows violations.
-- `examples/demo` is a stack with compliant and violating resources for every policy. `pulumi preview`
-  on it needs no AWS credentials; the README command sets dummy keys and `aws:skipCredentialsValidation`.
-
-## Seeing every verdict
-
-```sh
-venv/bin/python audit.py --stack org/stack --config examples/policy-config.example.json
-```
-
-## What the live runs taught us
-
-- **Give the model facts, not raw JSON.** Raw IAM statements scored 0.52 to 0.59 on escalation chains.
-  The same cases scored 0.81 to 0.98 once code extracted the relevant actions and principal kinds.
-  Better still, most of those cases turned out to be decidable in code, so they never reach the model.
-- **Thresholds are not the fix.** `DEFAULT = 0.8` and `HIGH = 0.85` in `judge.py` never moved. On the
-  live suite every intended violation scored 0.85 or higher and every intended pass 0.20 or lower.
-- **Jev is literal.** Arithmetic, dates, counting, and CIDR math stay in code. Environment names are
-  classified into a fixed set, and dev and test count as one class so `ci-scratch` next to `env: dev`
-  is not a mismatch.
-- **Unknowns in preview.** A policy document computed from other resources is unknown during preview.
-  Those policies mark themselves not applicable for that preview and evaluate on `pulumi up`.
-
-## Limits
-
-- The S3 checks read the inline `serverSideEncryptionConfiguration`, `versioning`, and `lifecycleRules`
-  inputs on `aws.s3.Bucket`. Stacks that use the separate configuration resources need a stack-level
-  policy instead.
-- One request per policy per resource. Batching every question for a resource into one request is the
-  obvious next step.
-- Rate limits on the TypeSafe side change without notice. The SDK retries with backoff.
+Unknown preview inputs are deferred by Pulumi. The `0.8` threshold is
+illustrative, not a calibrated production guarantee. Model judgments can vary.
