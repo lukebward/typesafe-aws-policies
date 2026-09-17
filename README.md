@@ -24,24 +24,26 @@ use purpose tags describing staff workflows versus shoppers, not names like
 
 ## Try it
 
-Requires Python 3.10+, `uv`, and the Pulumi CLI. **The live tests and demo also
-require a TypeSafe API key.** Get a key from the [TypeSafe console](https://console.typesafe.ai/)
-and export it as `TYPESAFE_API_KEY` in the shell where you run these commands.
+Requires Python 3.10+, `uv`, and the Pulumi CLI, with your usual Pulumi backend
+and AWS credentials configured. Set `TYPESAFE_API_KEY` in your shell using a key
+from the [TypeSafe console](https://console.typesafe.ai/).
 
-From the repository root:
+One-time setup from the repository root:
 
 ```sh
-export TYPESAFE_API_KEY=your-key
-./preview.sh
+uv venv venv
+uv pip install --python venv/bin/python -r requirements.txt -r examples/demo/requirements.txt
+pulumi -C examples/demo stack select dev --create
 ```
 
-The script installs Python dependencies, prepares a local Pulumi stack, and
-previews six resources: two EC2 instances, two ingress rules, and two IAM policies.
-Nothing is deployed; no AWS account or Pulumi login is needed. Run the same
-command again whenever you change a policy or demo resource.
+Preview:
 
-If your key is in the gitignored `.env`, load it first with
-`set -a; source .env; set +a`.
+```sh
+pulumi -C examples/demo preview --policy-pack ../..
+```
+
+This uses your existing shell environment and previews six resources: two EC2
+instances, two ingress rules, and two IAM policies. Nothing is deployed.
 
 Expect three findings: `reconciliation`, `staff-portal`, and `metrics-reader`.
 Preview should finish successfully with three advisory findings. The other
@@ -49,7 +51,7 @@ three resources should pass. Model judgments can vary.
 
 ## Tests
 
-After running the preview script:
+From the repository root after setup:
 
 ```sh
 venv/bin/python -m pytest -q
@@ -57,8 +59,6 @@ RUN_LIVE=1 venv/bin/python -m pytest -q -s -k live
 ```
 
 Offline tests need no API key. Live tests use your exported `TYPESAFE_API_KEY`.
-For tests without previewing, install dependencies with `uv venv venv` followed by
-`uv pip install --python venv/bin/python -r requirements.txt`.
 
 ## POC scope
 

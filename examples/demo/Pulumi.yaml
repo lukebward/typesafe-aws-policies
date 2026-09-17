@@ -2,5 +2,5 @@ name: typesafe-aws-policies-demo
 runtime:
   name: python
   options:
-    virtualenv: venv
+    virtualenv: ../../venv
 description: Good and bad AWS resources to exercise the typesafe-aws-policies pack.
