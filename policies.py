@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from typing import Callable, NamedTuple
 
-from pulumi_policy import EnforcementLevel, Severity
+from pulumi_policy import EnforcementLevel, PolicyConfigSchema, Severity
+from pulumi_policy.proxy import UnknownValueError
 from typesafe_sdk import Choice, Noul, NoulCriteria, Score
 
 import judge
@@ -18,7 +19,7 @@ S3_BUCKET = "aws:s3/bucket:Bucket"
 RDS_INSTANCE, RDS_CLUSTER = "aws:rds/instance:Instance", "aws:rds/cluster:Cluster"
 DYNAMODB_TABLE = "aws:dynamodb/table:Table"
 IAM_POLICY_TYPES = ("aws:iam/policy:Policy", "aws:iam/rolePolicy:RolePolicy", "aws:iam/userPolicy:UserPolicy", "aws:iam/groupPolicy:GroupPolicy")
-IAM_ROLE, IAM_USER = "aws:iam/role:Role", "aws:iam/user:User"
+IAM_ROLE, IAM_NATIVE_ROLE, IAM_USER = "aws:iam/role:Role", "aws-native:iam:Role", "aws:iam/user:User"
 SG, SG_RULE, VPC_INGRESS_RULE = "aws:ec2/securityGroup:SecurityGroup", "aws:ec2/securityGroupRule:SecurityGroupRule", "aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule"
 LAMBDA, ECS_TASK, CODEBUILD = "aws:lambda/function:Function", "aws:ecs/taskDefinition:TaskDefinition", "aws:codebuild/project:Project"
 SQS_QUEUE = "aws:sqs/queue:Queue"
@@ -31,6 +32,13 @@ SENSITIVE_CRITERIA = NoulCriteria(
     true="Names or tags mention customers, users, PII, patients, payments, finance, secrets, credentials, backups, audit, compliance, or a regulated data class",
     false="Names or tags describe public assets, static sites, scratch or test data, caches, or build artifacts",
 )
+
+
+def _document(args, key):
+    try:
+        return args.props.get(key)
+    except UnknownValueError:
+        args.not_applicable(f"{key} is not known during preview; the policy runs on update")
 
 
 def _statements(doc):
@@ -85,10 +93,13 @@ RESOURCE_POLICY_TYPES = ("aws:s3/bucketPolicy:BucketPolicy", "aws:kms/key:Key", 
 
 def resource_policy_not_open(args, report):
     """Resource policies on S3, KMS, SQS, SNS, and Secrets Manager must not let anonymous or arbitrary principals in."""
-    if args.resource_type not in RESOURCE_POLICY_TYPES or not args.props.get("policy"):
+    if args.resource_type not in RESOURCE_POLICY_TYPES:
+        return
+    policy = _document(args, "policy")
+    if not policy:
         return
     gray = []
-    for stmt in _statements(args.props["policy"]):
+    for stmt in _statements(policy):
         if stmt.get("Effect") != "Allow" or not _wildcard_principal(stmt):
             continue
         if not stmt.get("Condition"):
@@ -233,7 +244,7 @@ def iam_no_admin_equivalent(args, report):
     """IAM policies must not grant administrator-equivalent access, directly or through an escalation path."""
     if args.resource_type not in IAM_POLICY_TYPES:
         return
-    stmts = _statements(args.props["policy"])
+    stmts = _statements(_document(args, "policy"))
     caps = _capabilities(stmts)
     for chain in ESCALATION_CHAINS:
         if chain <= caps:
@@ -263,7 +274,7 @@ def iam_grant_matches_stated_purpose(args, report):
         "policy_name": _display_name(args, "name"),
         "description": args.props.get("description"),
         "tags": judge.plain(_tags(args) or {}),
-        "statements": _statements(args.props["policy"]),
+        "statements": _statements(_document(args, "policy")),
     }
     score = judge.ask(
         state,
@@ -285,10 +296,18 @@ def iam_grant_matches_stated_purpose(args, report):
 # 6
 RESTRICTING_CONDITION_KEYS = {"sts:externalid", "aws:principalorgid", "aws:principalarn", "aws:sourcearn", "aws:sourceaccount", "aws:principalaccount"}
 ACCOUNT_WIDE = re.compile(r"^(\d{12}|arn:aws:iam::\d{12}:root)$")
+TRUST_CONFIG = PolicyConfigSchema(properties={
+    "ownAccountId": {"type": "string", "description": "The AWS account that owns the stack. Same-account root trust is accepted."},
+    "trustedAccountIds": {"type": "array", "items": {"type": "string"}, "description": "Other accounts allowed to assume roles without a condition."},
+})
 
 
 def _condition_keys(stmt):
     return [k for op in (stmt.get("Condition") or {}).values() for k in op]
+
+
+def _account_of(principal):
+    return re.sub(r"\D", "", ",".join(_as_list(principal.get("AWS"))))[:12]
 
 
 def _trust_digest(stmt):
@@ -297,27 +316,44 @@ def _trust_digest(stmt):
     return {"principal_kind": kind, "principal": principal, "condition_keys": _condition_keys(stmt), "condition": stmt.get("Condition") or {}}
 
 
+def _trust_statements(args):
+    if args.resource_type == IAM_ROLE:
+        doc = _document(args, "assumeRolePolicy")
+    elif args.resource_type == IAM_NATIVE_ROLE:
+        doc = _document(args, "assumeRolePolicyDocument")
+    else:
+        return []
+    return [s for s in _statements(doc) if s.get("Effect") == "Allow"] if doc else []
+
+
+def _account_wide_unrestricted(stmt):
+    if _wildcard_principal(stmt):
+        return None
+    digest = _trust_digest(stmt)
+    restricting = {k.lower() for k in digest["condition_keys"]} & RESTRICTING_CONDITION_KEYS
+    return _account_of(digest["principal"]) if digest["principal_kind"] == "aws-account" and not restricting else None
+
+
 def iam_trust_policy_restricted(args, report):
     """IAM role trust policies must pin who can assume the role, including federated subjects and cross-account conditions."""
-    if args.resource_type != IAM_ROLE or not args.props.get("assumeRolePolicy"):
-        return
+    config = args.get_config() or {}
+    own = config.get("ownAccountId")
+    trusted = set(config.get("trustedAccountIds") or []) | ({own} if own else set())
     gray = []
-    for stmt in _statements(args.props["assumeRolePolicy"]):
-        if stmt.get("Effect") != "Allow":
-            continue
+    for stmt in _trust_statements(args):
         principal = stmt.get("Principal")
         if not isinstance(principal, Mapping) and principal != "*":
             continue
-        restricting = {k.lower() for k in _condition_keys(stmt)} & RESTRICTING_CONDITION_KEYS
+        account = _account_wide_unrestricted(stmt)
         if _wildcard_principal(stmt) and not stmt.get("Condition"):
             report("trust policy lets every principal assume the role with no Condition")
+        elif account:
+            if own and account not in trusted:
+                report(f"trust policy lets every identity in account {account} assume the role without sts:ExternalId, aws:PrincipalArn, or an organization condition")
+        elif isinstance(principal, Mapping) and set(principal) == {"Service"}:
             continue
-        digest = _trust_digest(stmt)
-        if digest["principal_kind"] == "aws-account" and not restricting:
-            account = re.sub(r"\D", "", ",".join(_as_list(principal.get("AWS"))))[:12]
-            report(f"trust policy lets every identity in account {account} assume the role without sts:ExternalId, aws:PrincipalArn, or an organization condition")
-        elif digest["principal_kind"] == "federated" or _wildcard_principal(stmt) or restricting:
-            gray.append(digest)
+        elif "Federated" in principal or stmt.get("Condition"):
+            gray.append(_trust_digest(stmt))
     if not gray:
         return
     questions = {
@@ -335,6 +371,18 @@ def iam_trust_policy_restricted(args, report):
         p = answers[f"stmt_{i}"].noul
         if p >= judge.DEFAULT:
             report(f"trust policy statement lets untrusted principals assume the role {_percent(p)}")
+
+
+def iam_trust_account_wide(args, report):
+    """Roles that any identity in an account can assume should be reviewed. Set ownAccountId to accept same-account trust."""
+    config = args.get_config() or {}
+    own = config.get("ownAccountId")
+    trusted = set(config.get("trustedAccountIds") or []) | ({own} if own else set())
+    for stmt in _trust_statements(args):
+        account = _account_wide_unrestricted(stmt)
+        if account and account not in trusted:
+            hint = "" if own else "; set ownAccountId in the policy config to accept same-account trust"
+            report(f"any identity in account {account} with sts:AssumeRole permission can assume this role{hint}")
 
 
 # 7
@@ -632,6 +680,7 @@ class Rule(NamedTuple):
     validate: Callable
     enforcement: EnforcementLevel
     severity: Severity
+    config_schema: PolicyConfigSchema | None = None
 
 
 MANDATORY, ADVISORY = EnforcementLevel.MANDATORY, EnforcementLevel.ADVISORY
@@ -642,7 +691,8 @@ POLICIES = [
     Rule("prod-or-sensitive-store-protected", prod_or_sensitive_store_protected, MANDATORY, Severity.HIGH),
     Rule("iam-no-admin-equivalent", iam_no_admin_equivalent, MANDATORY, Severity.CRITICAL),
     Rule("iam-grant-matches-stated-purpose", iam_grant_matches_stated_purpose, ADVISORY, Severity.HIGH),
-    Rule("iam-trust-policy-restricted", iam_trust_policy_restricted, MANDATORY, Severity.CRITICAL),
+    Rule("iam-trust-policy-restricted", iam_trust_policy_restricted, MANDATORY, Severity.CRITICAL, TRUST_CONFIG),
+    Rule("iam-trust-account-wide", iam_trust_account_wide, ADVISORY, Severity.MEDIUM, TRUST_CONFIG),
     Rule("iam-no-service-users", iam_no_service_users, ADVISORY, Severity.MEDIUM),
     Rule("sg-rule-matches-description", sg_rule_matches_description, MANDATORY, Severity.HIGH),
     Rule("sg-description-meaningful", sg_description_meaningful, ADVISORY, Severity.LOW),
@@ -653,3 +703,23 @@ POLICIES = [
     Rule("name-consistent-with-config", name_consistent_with_config, ADVISORY, Severity.MEDIUM),
     Rule("sqs-work-queue-has-dlq", sqs_work_queue_has_dlq, ADVISORY, Severity.MEDIUM),
 ]
+
+POLICIES_BY_NAME = {rule.name: rule for rule in POLICIES}
+
+# Resource types each validator can act on. Used by audit.py to tell a pass from a skip.
+APPLICABLE_TYPES = {
+    "resource_policy_not_open": RESOURCE_POLICY_TYPES,
+    "sensitive_data_store_encrypted": tuple(ENCRYPTED),
+    "prod_or_sensitive_store_protected": (RDS_INSTANCE, RDS_CLUSTER, S3_BUCKET, DYNAMODB_TABLE),
+    "iam_no_admin_equivalent": IAM_POLICY_TYPES,
+    "iam_grant_matches_stated_purpose": IAM_POLICY_TYPES,
+    "iam_trust_policy_restricted": (IAM_ROLE, IAM_NATIVE_ROLE),
+    "iam_trust_account_wide": (IAM_ROLE, IAM_NATIVE_ROLE),
+    "iam_no_service_users": (IAM_USER,),
+    "sg_rule_matches_description": (SG, SG_RULE, VPC_INGRESS_RULE),
+    "sg_description_meaningful": (SG,),
+    "internal_resource_not_public": tuple(PUBLIC),
+    "log_and_temp_buckets_have_lifecycle": (S3_BUCKET,),
+    "no_plaintext_secrets_in_env": (LAMBDA, ECS_TASK, CODEBUILD),
+    "sqs_work_queue_has_dlq": (SQS_QUEUE,),
+}

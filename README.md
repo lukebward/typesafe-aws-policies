@@ -45,7 +45,8 @@ Code decides every case it can decide exactly. The model only gets the gray zone
 | prod-or-sensitive-store-protected | RDS, S3, DynamoDB | backups, deletion protection, multi-AZ, versioning, PITR | is this production, is this sensitive (one request, two questions) |
 | iam-no-admin-equivalent | IAM policies | known escalation chains from an action catalog (PassRole plus compute, policy version edits, attach policy, create credentials), wildcards and NotAction included | whether an unlisted service wildcard, combined with PassRole, can run code under a passed role |
 | iam-grant-matches-stated-purpose | IAM policies | none | Score: does the grant match the name and description, go somewhat beyond, or far beyond |
-| iam-trust-policy-restricted | IAM roles | `Principal: *` with no Condition, and account-wide principals without ExternalId, PrincipalArn, or org conditions, outright; service principals and named roles skipped | federated subject breadth (OIDC `sub` wildcards like `repo:org/*:*`) and whether conditioned principals are really pinned |
+| iam-trust-policy-restricted | IAM roles (aws and aws-native) | `Principal: *` with no Condition outright; cross-account root trust without ExternalId, PrincipalArn, or org conditions when `ownAccountId` is configured; service principals and named roles skipped | federated subject breadth (OIDC `sub` wildcards like `repo:org/*:*`) and whether conditioned principals are really pinned |
+| iam-trust-account-wide | IAM roles (aws and aws-native) | account-wide root trust without a restricting condition, unless the account is `ownAccountId` or in `trustedAccountIds` | none |
 | iam-no-service-users | IAM users | none | does the user name identify a machine rather than a person |
 | sg-rule-matches-description | security groups and ingress rules | rule is public or broad; missing description is a violation outright | does the rule allow substantially more than its description claims |
 | sg-description-meaningful | security groups | none | Score on description quality |
@@ -56,13 +57,33 @@ Code decides every case it can decide exactly. The model only gets the gray zone
 | name-consistent-with-config | any resource with an env tag | env tag present | does the name imply a different environment than the tag |
 | sqs-work-queue-has-dlq | SQS queues | redrive policy present | is this a primary work queue rather than a dead-letter or fan-out queue |
 
-Security policies are MANDATORY. Hygiene policies (purpose fit, names, descriptions, tags, IAM users, lifecycle, DLQ) are ADVISORY.
+Security policies are MANDATORY. Hygiene policies (purpose fit, names, descriptions, tags, IAM users, lifecycle, DLQ, account-wide trust) are ADVISORY.
+
+## Running against a real stack
+
+```sh
+# from the stack's project directory
+pulumi preview --policy-pack ~/Workspace/Pulumi/typesafe-aws-policies \
+  --policy-pack-config ~/Workspace/Pulumi/typesafe-aws-policies/examples/policy-config.example.json
+```
+
+- Set `ownAccountId` in the config to the stack's AWS account. Same-account root trust (`arn:aws:iam::<own>:root`) is a
+  common, intentional pattern and is then accepted. Without it, such roles show as an advisory so nothing blocks.
+- Inputs that are computed from other resources are unknown during a preview. Policies that need them mark themselves
+  not applicable for that preview and evaluate on `pulumi up`, when the values are known.
+- To start advisory-only across the pack, add `"all": {"enforcementLevel": "advisory"}` to the config file.
+- A preview only prints violations. To see every verdict, passes included, audit the stack's state instead:
+
+```sh
+venv/bin/python audit.py --stack org/stack --config examples/policy-config.example.json
+```
 
 ## Layout
 
 - `judge.py` wraps the TypeSafe client: API key, in-process cache, shared env Choice, value-shape helper.
 - `policies.py` holds the 15 validators and the `POLICIES` registry.
 - `__main__.py` wires the registry into a `PolicyPack`.
+- `audit.py` runs every policy over `pulumi stack export` output and prints each verdict.
 - `test_policies.py` runs every policy against a fake client. `test_live.py` runs them against the real model.
 - `examples/demo` is a stack with compliant and violating resources for each policy.
 

@@ -15,6 +15,7 @@ PolicyPack(
             validate=rule.validate,
             enforcement_level=rule.enforcement,
             severity=rule.severity,
+            config_schema=rule.config_schema,
         )
         for rule in policies.POLICIES
     ],

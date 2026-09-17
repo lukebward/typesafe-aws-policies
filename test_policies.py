@@ -4,6 +4,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from pulumi_policy import EnforcementLevel, Severity
+from pulumi_policy.proxy import unknown_checking_proxy
 from typesafe_sdk import Choice, Noul, Score
 
 import judge
@@ -42,9 +43,18 @@ def fake(monkeypatch):
     return f
 
 
-def run(fn, resource_type, props, name="res"):
+class NotApplicable(Exception):
+    pass
+
+
+def run(fn, resource_type, props, name="res", config=None):
     out = []
-    args = SimpleNamespace(resource_type=resource_type, props=MappingProxyType(props), name=name, urn=f"urn::{name}")
+
+    def not_applicable(reason=None):
+        raise NotApplicable(reason)
+
+    args = SimpleNamespace(resource_type=resource_type, props=unknown_checking_proxy(dict(props)), name=name, urn=f"urn::{name}",
+                           get_config=lambda: config or {}, not_applicable=not_applicable)
     fn(args, lambda m, urn=None: out.append(m))
     return out
 
@@ -246,13 +256,38 @@ def test_trust_service_principal_skips_model(fake):
     assert fake.calls == []
 
 
-def test_trust_account_wide_principal_without_restricting_condition_reported_by_code(fake):
-    for principal, cond in (("arn:aws:iam::999999999999:root", None), ("999999999999", None), ("arn:aws:iam::999999999999:root", {"Bool": {"aws:SecureTransport": "true"}})):
+def test_trust_account_wide_without_own_account_config_is_advisory_only(fake):
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole"}
+    props = {"assumeRolePolicy": doc(stmt)}
+    assert run(policies.iam_trust_policy_restricted, ROLE, props) == []
+    msgs = run(policies.iam_trust_account_wide, ROLE, props)
+    assert len(msgs) == 1 and "999999999999" in msgs[0] and "ownAccountId" in msgs[0]
+    assert fake.calls == []
+
+
+def test_trust_same_account_root_is_silent_when_own_account_configured(fake):
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole"}
+    props, config = {"assumeRolePolicy": doc(stmt)}, {"ownAccountId": "999999999999"}
+    assert run(policies.iam_trust_policy_restricted, ROLE, props, config=config) == []
+    assert run(policies.iam_trust_account_wide, ROLE, props, config=config) == []
+    assert fake.calls == []
+
+
+def test_trust_cross_account_root_is_mandatory_when_own_account_configured(fake):
+    for principal, cond in (("arn:aws:iam::111111111111:root", None), ("111111111111", None), ("arn:aws:iam::111111111111:root", {"Bool": {"aws:SecureTransport": "true"}})):
         stmt = {"Effect": "Allow", "Principal": {"AWS": principal}, "Action": "sts:AssumeRole"}
         if cond:
             stmt["Condition"] = cond
-        assert len(run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)})) == 1, principal
+        msgs = run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)}, config={"ownAccountId": "999999999999"})
+        assert len(msgs) == 1 and "111111111111" in msgs[0], principal
     assert fake.calls == []
+
+
+def test_trust_listed_trusted_account_is_allowed(fake):
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111111111111:root"}, "Action": "sts:AssumeRole"}
+    config = {"ownAccountId": "999999999999", "trustedAccountIds": ["111111111111"]}
+    assert run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)}, config=config) == []
+    assert run(policies.iam_trust_account_wide, ROLE, {"assumeRolePolicy": doc(stmt)}, config=config) == []
 
 
 def test_trust_named_role_principal_without_condition_passes_without_model(fake):
@@ -276,6 +311,19 @@ def test_trust_cross_account_with_external_id_goes_to_model_and_passes(fake):
     stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"sts:ExternalId": "vendor-42"}}}
     assert run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)}) == []
     assert fake.calls[0][0]["statements"][0]["principal_kind"] == "aws-account"
+
+
+# unknown documents during preview
+def test_unknown_policy_document_marks_policy_not_applicable(fake):
+    from pulumi_policy.proxy import UNKNOWN_STRING_VALUE
+    for fn, rtype, key in ((policies.iam_no_admin_equivalent, IAM_POLICY, "policy"),
+                           (policies.iam_grant_matches_stated_purpose, IAM_POLICY, "policy"),
+                           (policies.iam_trust_policy_restricted, ROLE, "assumeRolePolicy"),
+                           (policies.iam_trust_account_wide, ROLE, "assumeRolePolicy"),
+                           (policies.resource_policy_not_open, BUCKET_POLICY, "policy")):
+        with pytest.raises(NotApplicable, match="preview"):
+            run(fn, rtype, {key: UNKNOWN_STRING_VALUE})
+    assert fake.calls == []
 
 
 # 7 iam-no-service-users
@@ -505,7 +553,9 @@ def test_dead_letter_queue_itself_passes(fake):
 # registry
 def test_registry_has_fifteen_unique_documented_policies():
     names = [p.name for p in policies.POLICIES]
-    assert len(names) == 15 and len(set(names)) == 15
+    assert len(names) == 16 and len(set(names)) == 16
+    assert policies.POLICIES_BY_NAME["iam-trust-policy-restricted"].config_schema is not None
+    assert policies.POLICIES_BY_NAME["iam-trust-account-wide"].config_schema is not None
     for p in policies.POLICIES:
         assert p.validate.__doc__
         assert isinstance(p.enforcement, EnforcementLevel)

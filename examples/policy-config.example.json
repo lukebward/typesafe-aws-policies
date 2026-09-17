@@ -1,0 +1,10 @@
+{
+  "iam-trust-policy-restricted": {
+    "ownAccountId": "123456789012",
+    "trustedAccountIds": []
+  },
+  "iam-trust-account-wide": {
+    "ownAccountId": "123456789012",
+    "trustedAccountIds": []
+  }
+}

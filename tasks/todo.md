@@ -17,4 +17,7 @@
   gets the residue (unlisted service wildcards with PassRole, federated subject breadth). Residue cases score 0.85 to 0.98.
 - False positive found and fixed: 'ci-scratch' read as test environment vs dev tag. dev and test now share one class.
 - Cosmetics fixed: float ports rendered as 22.0, Pulumi auto-name suffixes leaking into messages and model state.
+- Real-stack run (pulumi/pulumi-service-review-stacks/lward-local): first pass blocked on same-account root trust and showed
+  'can't run during preview' for a computed IAM policy. Fixed with ownAccountId/trustedAccountIds config, an advisory
+  iam-trust-account-wide policy, not-applicable on unknown documents, aws-native role support, and audit.py for full verdicts.
 - Follow-ups: batch all questions for one resource into one request; stack-level policy for the separate S3 configuration resources.
