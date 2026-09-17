@@ -3,4 +3,3 @@ config:
   aws:skipCredentialsValidation: "true"
   aws:skipRequestingAccountId: "true"
   aws:skipMetadataApiCheck: "true"
-encryptionsalt: v1:mQ/4h4kP7Dw=:v1:Or0yKaCUKekQz6ka:qzwtcnoEAqj5/DeCzEt59+4ub1Gt0Q==
