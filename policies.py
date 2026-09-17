@@ -314,7 +314,8 @@ def iam_trust_policy_restricted(args, report):
             continue
         digest = _trust_digest(stmt)
         if digest["principal_kind"] == "aws-account" and not restricting:
-            report("trust policy lets every identity in another account assume the role without sts:ExternalId, aws:PrincipalArn, or an organization condition")
+            account = re.sub(r"\D", "", ",".join(_as_list(principal.get("AWS"))))[:12]
+            report(f"trust policy lets every identity in account {account} assume the role without sts:ExternalId, aws:PrincipalArn, or an organization condition")
         elif digest["principal_kind"] == "federated" or _wildcard_principal(stmt) or restricting:
             gray.append(digest)
     if not gray:
