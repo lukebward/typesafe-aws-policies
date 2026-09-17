@@ -7,6 +7,16 @@ The idea in one line: **code decides every case it can decide exactly, and the m
 gray zone.** A wildcard principal with no condition is a violation without any AI call. Whether the
 condition that *is* there actually limits who can call is a question for the model.
 
+## Start with the POC
+
+For a quick walkthrough, use [`poc/`](poc/README.md): three advisory policies,
+all implemented in one [70-line file](poc/__main__.py), with a six-resource demo.
+It checks internal EC2 instances, temporary S3 buckets, and SQS work queues.
+
+The original **16-policy pack remains at the repository root**, with its full
+AWS coverage, audit CLI, tests, and demo. The instructions below describe that
+full pack; [POC setup and preview instructions](poc/README.md#try-it) are separate.
+
 ## How a policy works
 
 ```

@@ -23,3 +23,14 @@
 - Refactor 2026-09-17: @policy decorator (registry, type guard, applicability in one place), judge.noul_each for fan-out,
   Q_* question constants above each policy, classify_trust shared by both trust policies. 725 -> 694 lines, longest function 25 lines.
 - Follow-ups: batch all questions for one resource into one request; stack-level policy for the separate S3 configuration resources.
+
+## Standalone POC
+
+- [x] Keep the original root pack, tests, config, and demo intact.
+- [x] Add the three-policy, 70-line implementation under `poc/` with its own tests and demo.
+- [x] Update root README and POC README with entry points and runnable commands.
+- [x] Verify 93 original offline tests plus 22 POC offline tests.
+- [x] Verify all 28 POC tests, including six live cases, in its own environment.
+- [x] Run preview from `poc/examples/demo`: exit 0, three expected advisory findings.
+
+Review: original implementation files preserved. Tests and POC preview verified; no resources deployed.

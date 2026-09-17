@@ -1,0 +1,5 @@
+config:
+  aws:region: us-west-2
+  aws:skipCredentialsValidation: "true"
+  aws:skipRequestingAccountId: "true"
+  aws:skipMetadataApiCheck: "true"
