@@ -3,6 +3,7 @@ import json
 import os
 import string
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from typesafe_sdk import Choice, Noul, TypeSafeClient
 
@@ -23,9 +24,21 @@ ENV_CRITERIA = {
 }
 
 
+def load_dotenv(path=Path(__file__).with_name(".env")):
+    if not Path(path).is_file():
+        return
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
 def _get_client():
     global _client
     if _client is None:
+        load_dotenv()
         if not os.environ.get("TYPESAFE_API_KEY"):
             raise RuntimeError("TYPESAFE_API_KEY is not set. The typesafe-aws-policies pack needs it to evaluate policies.")
         _client = TypeSafeClient()

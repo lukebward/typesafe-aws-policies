@@ -100,3 +100,22 @@ def test_env_class_asks_choice_over_env_tag_value():
     assert state == {"tag_key": "Environment", "tag_value": "prd-us-east"}
     assert isinstance(questions["env"], Choice)
     assert set(questions["env"].criteria) == {"production", "staging", "development", "test", "unknown"}
+
+
+def test_load_dotenv_sets_key_from_file_next_to_judge(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("# comment\nTYPESAFE_API_KEY=from-file\nOTHER=x\n")
+    judge.load_dotenv(env_file)
+    assert judge.os.environ["TYPESAFE_API_KEY"] == "from-file"
+
+
+def test_load_dotenv_does_not_override_existing_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "from-env")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TYPESAFE_API_KEY=from-file\n")
+    judge.load_dotenv(env_file)
+    assert judge.os.environ["TYPESAFE_API_KEY"] == "from-env"
+
+
+def test_load_dotenv_ignores_missing_file(tmp_path):
+    judge.load_dotenv(tmp_path / "nope.env")

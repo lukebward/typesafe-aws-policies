@@ -16,7 +16,7 @@ uv pip install --python venv/bin/python -r requirements.txt
 # unit tests, no network
 venv/bin/python -m pytest -q test_judge.py test_policies.py
 
-# live tests against the real model
+# live tests against the real model (or put TYPESAFE_API_KEY=... in a .env next to judge.py; it is gitignored)
 TYPESAFE_API_KEY=... venv/bin/python -m pytest -q test_live.py -s
 
 # demo preview on the local file backend, no AWS credentials needed
