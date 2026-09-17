@@ -35,6 +35,13 @@ def test_audit_passes_policy_config(fake):
     assert [r for r in rows if r.policy == "iam-trust-account-wide"][0].violations == []
 
 
+def test_audit_marks_tag_policies_applicable_only_with_tags(fake):
+    rows = audit.audit(state_with(("aws:sqs/queue:Queue", "q", {"name": "jobs", "tags": {"owner": "todo"}}),
+                                  ("aws:sqs/queue:Queue", "untagged", {"name": "jobs"})), config={})
+    by = {(r.resource, r.policy): r.applicable for r in rows}
+    assert by[("q", "tags-meaningful")] is True and by[("untagged", "tags-meaningful")] is False
+
+
 def test_audit_skips_deleted_and_provider_resources(fake):
     s = state_with(("pulumi:providers:aws", "default", {}), ("aws:iam/user:User", "u", {"name": "ci-deploy-bot"}))
     s["deployment"]["resources"][1]["delete"] = True

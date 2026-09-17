@@ -20,4 +20,6 @@
 - Real-stack run (pulumi/pulumi-service-review-stacks/lward-local): first pass blocked on same-account root trust and showed
   'can't run during preview' for a computed IAM policy. Fixed with ownAccountId/trustedAccountIds config, an advisory
   iam-trust-account-wide policy, not-applicable on unknown documents, aws-native role support, and audit.py for full verdicts.
+- Refactor 2026-09-17: @policy decorator (registry, type guard, applicability in one place), judge.noul_each for fan-out,
+  Q_* question constants above each policy, classify_trust shared by both trust policies. 725 -> 694 lines, longest function 25 lines.
 - Follow-ups: batch all questions for one resource into one request; stack-level policy for the separate S3 configuration resources.

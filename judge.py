@@ -65,6 +65,16 @@ def noul(state, instructions, criteria=None):
     return ask(state, {"q": Noul(instructions=instructions, criteria=criteria)}).nouls["q"].noul
 
 
+def noul_each(state, key, instructions, criteria=None):
+    """Ask the same yes/no question about every item in state[key] in one request. `{i}` in instructions is the index."""
+    items = state[key]
+    if not items:
+        return []
+    questions = {f"{key}_{i}": Noul(instructions=instructions.format(i=i), criteria=criteria) for i in range(len(items))}
+    answers = ask(state, questions).nouls
+    return [answers[f"{key}_{i}"].noul for i in range(len(items))]
+
+
 def is_public_cidr(cidr):
     return cidr in ("0.0.0.0/0", "::/0")
 

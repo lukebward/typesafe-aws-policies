@@ -369,7 +369,7 @@ def test_sg_private_broad_rule_with_honest_description_passes(fake):
 
 
 def test_sg_rules_fan_out_in_one_request(fake):
-    fake.noul = {"rule_0": 0.9, "rule_1": 0.1}
+    fake.noul = {"rules_0": 0.9, "rules_1": 0.1}
     props = {"ingress": [
         {"fromPort": 0, "toPort": 65535, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"], "description": "SSH for ops"},
         {"fromPort": 443, "toPort": 443, "protocol": "tcp", "ipv6CidrBlocks": ["::/0"], "description": "Public HTTPS"},
@@ -451,7 +451,7 @@ def test_durable_bucket_passes(fake):
 
 # 12 no-plaintext-secrets-in-env
 def test_lambda_env_flags_only_secret_like_vars(fake):
-    fake.noul = {"var_0": 0.95, "var_1": 0.03}
+    fake.noul = {"variables_0": 0.95, "variables_1": 0.03}
     props = {"environment": {"variables": {"DB_PASSWORD": "hunter2hunter2", "LOG_LEVEL": "info"}}}
     msgs = run(policies.no_plaintext_secrets_in_env, "aws:lambda/function:Function", props)
     assert len(msgs) == 1 and "DB_PASSWORD" in msgs[0]
@@ -556,6 +556,27 @@ def test_registry_has_fifteen_unique_documented_policies():
     assert len(names) == 16 and len(set(names)) == 16
     assert policies.POLICIES_BY_NAME["iam-trust-policy-restricted"].config_schema is not None
     assert policies.POLICIES_BY_NAME["iam-trust-account-wide"].config_schema is not None
+    assert policies.POLICIES_BY_NAME["iam-no-service-users"].types == ("aws:iam/user:User",)
+    assert policies.POLICIES_BY_NAME["tags-meaningful"].types is None
+
+
+def test_decorated_policy_skips_other_types_and_control_plane_without_calling_body(fake):
+    assert run(policies.iam_no_service_users, "aws:s3/bucket:Bucket", {"name": "ci-deploy-bot"}) == []
+    assert run(policies.tags_meaningful, "pulumi:providers:aws", {"tags": {"owner": "todo"}}) == []
+    assert fake.calls == []
+
+
+def test_classify_trust_statement_kinds():
+    c = policies.classify_trust
+    assert c({"Principal": "*"}) == ("wildcard-open", None)
+    assert c({"Principal": {"AWS": "*"}, "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}}}) == ("wildcard-conditioned", None)
+    assert c({"Principal": {"Service": "lambda.amazonaws.com"}}) == ("service", None)
+    assert c({"Principal": {"AWS": "arn:aws:iam::999999999999:root"}}) == ("account-wide-open", "999999999999")
+    assert c({"Principal": {"AWS": "999999999999"}, "Condition": {"Bool": {"aws:SecureTransport": "true"}}}) == ("account-wide-open", "999999999999")
+    assert c({"Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Condition": {"StringEquals": {"sts:ExternalId": "x"}}}) == ("account-wide-conditioned", "999999999999")
+    assert c({"Principal": {"AWS": "arn:aws:iam::999999999999:role/deployer"}}) == ("identity-open", "999999999999")
+    assert c({"Principal": {"AWS": "arn:aws:iam::999999999999:role/deployer"}, "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "true"}}}) == ("identity-conditioned", "999999999999")
+    assert c({"Principal": {"Federated": "arn:aws:iam::1:oidc-provider/x"}}) == ("federated", None)
     for p in policies.POLICIES:
         assert p.validate.__doc__
         assert isinstance(p.enforcement, EnforcementLevel)

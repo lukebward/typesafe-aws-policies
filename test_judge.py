@@ -120,3 +120,20 @@ def test_load_dotenv_does_not_override_existing_env(monkeypatch, tmp_path):
 
 def test_load_dotenv_ignores_missing_file(tmp_path):
     judge.load_dotenv(tmp_path / "nope.env")
+
+
+def test_noul_each_asks_one_question_per_item_and_returns_probabilities():
+    fake = FakeClient(SimpleNamespace(nouls={"rules_0": SimpleNamespace(noul=0.9), "rules_1": SimpleNamespace(noul=0.1)}))
+    judge._client = fake
+    probabilities = judge.noul_each({"rules": [{"port": 22}, {"port": 443}]}, "rules", "Is `rules[{i}]` an admin port?")
+    assert probabilities == [0.9, 0.1]
+    state, questions = fake.calls[0]
+    assert list(questions) == ["rules_0", "rules_1"]
+    assert questions["rules_1"].instructions == "Is `rules[1]` an admin port?"
+
+
+def test_noul_each_with_no_items_makes_no_call():
+    fake = FakeClient(None)
+    judge._client = fake
+    assert judge.noul_each({"rules": []}, "rules", "Is `rules[{i}]` an admin port?") == []
+    assert fake.calls == []

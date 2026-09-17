@@ -43,22 +43,20 @@ def audit(state, config):
 
             args = SimpleNamespace(resource_type=rtype, props=unknown_checking_proxy(res.get("inputs") or {}), name=name, urn=res["urn"],
                                    get_config=lambda r=rule: config.get(r.name) or {}, not_applicable=not_applicable)
-            applicable = True
             try:
                 rule.validate(args, lambda m, urn=None: out.append(m))
+                applicable = _applies(rule, rtype, res.get("inputs") or {})
             except _NotApplicable:
                 applicable = False
-            applicable = applicable and (bool(out) or _touched(rule, rtype, args))
             rows.append(Row(name, rtype, rule.name, applicable, out))
     return rows
 
 
-def _touched(rule, rtype, args):
-    """A policy counts as applicable when its resource-type filter matches and its required inputs exist."""
-    fn = rule.validate.__name__
-    if fn in ("tags_meaningful", "name_consistent_with_config"):
-        return isinstance(args.props.get("tags"), dict) or hasattr(args.props.get("tags"), "items")
-    return rtype in policies.APPLICABLE_TYPES.get(fn, ())
+def _applies(rule, rtype, inputs):
+    """Policies without a type list apply to any cloud resource that carries tags."""
+    if rule.types is None:
+        return isinstance(inputs.get("tags"), dict)
+    return rtype in rule.types
 
 
 def main():
