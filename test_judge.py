@@ -13,6 +13,9 @@ def reset_judge(monkeypatch):
     judge._client = None
     judge._cache.clear()
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    yield
+    judge._client = None
+    judge._cache.clear()
 
 
 class FakeClient:
