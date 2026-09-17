@@ -7,6 +7,7 @@
 - [x] examples/demo stack, offline preview
 - [x] README
 - [ ] Private GitHub repo, push
+- [x] Rewrite: code decides exact cases, model gets the gray zone (15 policies)
 - [ ] Live run with TYPESAFE_API_KEY, tune thresholds
 
 ## Review

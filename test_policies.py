@@ -11,22 +11,27 @@ import policies
 
 
 class FakeAsk:
-    """Answers every question with canned values; a dict for nouls answers per question id."""
+    """Answers every question with canned values. Pass a dict keyed by question id for per-question answers."""
 
     def __init__(self, noul=0.0, choice=("unknown", 1.0), score=2.0):
         self.noul, self.choice, self.score = noul, choice, score
         self.calls = []
+
+    @staticmethod
+    def _pick(value, key):
+        return value[key] if isinstance(value, dict) else value
 
     def __call__(self, state, questions):
         self.calls.append((judge.plain(state), questions))
         nouls, choices, scores = {}, {}, {}
         for k, q in questions.items():
             if isinstance(q, Noul):
-                nouls[k] = SimpleNamespace(noul=self.noul[k] if isinstance(self.noul, dict) else self.noul)
+                nouls[k] = SimpleNamespace(noul=self._pick(self.noul, k))
             elif isinstance(q, Choice):
-                choices[k] = SimpleNamespace(choice=self.choice[0], confidence=self.choice[1])
+                label, confidence = self._pick(self.choice, k)
+                choices[k] = SimpleNamespace(choice=label, confidence=confidence)
             elif isinstance(q, Score):
-                scores[k] = SimpleNamespace(score=self.score)
+                scores[k] = SimpleNamespace(score=self._pick(self.score, k))
         return SimpleNamespace(nouls=nouls, choices=choices, scores=scores)
 
 
@@ -44,297 +49,407 @@ def run(fn, resource_type, props, name="res"):
     return out
 
 
-def statements(*stmts):
+def doc(*stmts):
     return json.dumps({"Version": "2012-10-17", "Statement": list(stmts)})
 
 
-# 1
-def test_s3_bucket_policy_not_public_reports_when_model_says_public(fake):
-    fake.noul = 0.95
-    pol = statements({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"})
-    msgs = run(policies.s3_bucket_policy_not_public, "aws:s3/bucketPolicy:BucketPolicy", {"policy": pol})
-    assert len(msgs) == 1 and "0.95" in msgs[0]
-    assert fake.calls[0][0] == {"statements": json.loads(pol)["Statement"]}
+BUCKET_POLICY = "aws:s3/bucketPolicy:BucketPolicy"
+ORG_CONDITION = {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+TLS_CONDITION = {"Bool": {"aws:SecureTransport": "true"}}
 
 
-def test_s3_bucket_policy_not_public_passes_when_model_says_private(fake):
-    fake.noul = 0.1
-    pol = statements({"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::1:root"}, "Action": "s3:GetObject", "Resource": "*"})
-    assert run(policies.s3_bucket_policy_not_public, "aws:s3/bucketPolicy:BucketPolicy", {"policy": pol}) == []
+# 1 resource-policy-not-open
+def test_resource_policy_wildcard_without_condition_is_reported_by_code(fake):
+    pol = doc({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"})
+    msgs = run(policies.resource_policy_not_open, BUCKET_POLICY, {"policy": pol})
+    assert len(msgs) == 1 and fake.calls == []
 
 
-def test_s3_bucket_policy_not_public_ignores_other_types(fake):
-    assert run(policies.s3_bucket_policy_not_public, "aws:s3/bucket:Bucket", {"policy": "{}"}) == []
-    assert fake.calls == []
-
-
-# 2
-def test_s3_sensitive_bucket_encrypted_reports_unencrypted_sensitive_bucket(fake):
+def test_resource_policy_wildcard_with_weak_condition_reported_by_model(fake):
     fake.noul = 0.9
-    msgs = run(policies.s3_sensitive_bucket_encrypted, "aws:s3/bucket:Bucket", {"bucket": "customer-pii-exports", "tags": {"owner": "data"}})
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*", "Condition": TLS_CONDITION}
+    msgs = run(policies.resource_policy_not_open, BUCKET_POLICY, {"policy": doc(stmt)})
+    assert len(msgs) == 1 and "0.90" in msgs[0]
+    assert fake.calls[0][0] == {"statements": [stmt]}
+
+
+def test_resource_policy_wildcard_with_strong_condition_passes(fake):
+    fake.noul = 0.05
+    stmt = {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*", "Condition": ORG_CONDITION}
+    assert run(policies.resource_policy_not_open, BUCKET_POLICY, {"policy": doc(stmt)}) == []
+    assert len(fake.calls) == 1
+
+
+def test_resource_policy_specific_principal_skips_model(fake):
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123:role/r"}, "Action": "s3:GetObject", "Resource": "*"}
+    assert run(policies.resource_policy_not_open, BUCKET_POLICY, {"policy": doc(stmt)}) == []
+    assert fake.calls == []
+
+
+def test_resource_policy_covers_kms_sqs_sns_secrets(fake):
+    open_stmt = doc({"Effect": "Allow", "Principal": {"AWS": ["*"]}, "Action": "kms:Decrypt", "Resource": "*"})
+    for rtype in ("aws:kms/key:Key", "aws:sqs/queuePolicy:QueuePolicy", "aws:sns/topicPolicy:TopicPolicy", "aws:secretsmanager/secretPolicy:SecretPolicy"):
+        assert len(run(policies.resource_policy_not_open, rtype, {"policy": open_stmt})) == 1, rtype
+    assert run(policies.resource_policy_not_open, "aws:kms/key:Key", {}) == []
+    assert fake.calls == []
+
+
+# 2 sensitive-data-store-encrypted
+def test_sensitive_store_unencrypted_rds_reported(fake):
+    fake.noul = 0.9
+    msgs = run(policies.sensitive_data_store_encrypted, "aws:rds/instance:Instance", {"identifier": "customer-pii-db", "storageEncrypted": False, "tags": {"team": "data"}})
     assert len(msgs) == 1
-    assert fake.calls[0][0] == {"bucket_name": "customer-pii-exports", "tags": {"owner": "data"}}
+    state = fake.calls[0][0]
+    assert state["resource_type"] == "aws:rds/instance:Instance" and state["name"] == "customer-pii-db" and state["tags"] == {"team": "data"}
 
 
-def test_s3_sensitive_bucket_encrypted_skips_when_encryption_configured(fake):
-    props = {"bucket": "customer-pii-exports", "serverSideEncryptionConfiguration": {"rule": {}}}
-    assert run(policies.s3_sensitive_bucket_encrypted, "aws:s3/bucket:Bucket", props) == []
+def test_sensitive_store_encrypted_rds_skips_model(fake):
+    assert run(policies.sensitive_data_store_encrypted, "aws:rds/cluster:Cluster", {"storageEncrypted": True}) == []
     assert fake.calls == []
 
 
-def test_s3_sensitive_bucket_encrypted_skips_bucket_v2_which_has_no_encryption_input(fake):
-    assert run(policies.s3_sensitive_bucket_encrypted, "aws:s3/bucketV2:BucketV2", {"bucket": "customer-pii-exports"}) == []
+def test_sensitive_store_dynamodb_ebs_efs_s3_fields(fake):
+    fake.noul = 0.9
+    assert run(policies.sensitive_data_store_encrypted, "aws:dynamodb/table:Table", {"serverSideEncryption": {"enabled": True}}) == []
+    assert len(run(policies.sensitive_data_store_encrypted, "aws:dynamodb/table:Table", {"name": "patients"})) == 1
+    assert run(policies.sensitive_data_store_encrypted, "aws:ebs/volume:Volume", {"encrypted": True}) == []
+    assert len(run(policies.sensitive_data_store_encrypted, "aws:efs/fileSystem:FileSystem", {"encrypted": False})) == 1
+    assert run(policies.sensitive_data_store_encrypted, "aws:s3/bucket:Bucket", {"serverSideEncryptionConfiguration": {"rule": {}}}) == []
+
+
+def test_sensitive_store_non_sensitive_passes(fake):
+    fake.noul = 0.1
+    assert run(policies.sensitive_data_store_encrypted, "aws:ebs/volume:Volume", {"encrypted": False}, name="scratch-volume") == []
+
+
+# 3 prod-or-sensitive-store-protected
+def test_store_protected_reports_every_gap_on_prod_rds(fake):
+    fake.choice, fake.noul = ("production", 0.9), 0.2
+    props = {"backupRetentionPeriod": 1, "deletionProtection": False, "multiAz": False, "tags": {"env": "prod"}}
+    msgs = run(policies.prod_or_sensitive_store_protected, "aws:rds/instance:Instance", props)
+    assert len(msgs) == 3 and len(fake.calls) == 1
+    questions = fake.calls[0][1]
+    assert isinstance(questions["env"], Choice) and isinstance(questions["sensitive"], Noul)
+
+
+def test_store_protected_hardened_rds_skips_model(fake):
+    props = {"backupRetentionPeriod": 7, "deletionProtection": True, "multiAz": True, "tags": {"env": "prod"}}
+    assert run(policies.prod_or_sensitive_store_protected, "aws:rds/instance:Instance", props) == []
     assert fake.calls == []
 
 
-def test_s3_sensitive_bucket_encrypted_uses_resource_name_when_bucket_unset(fake):
-    fake.noul = 0.2
-    run(policies.s3_sensitive_bucket_encrypted, "aws:s3/bucket:Bucket", {}, name="logs")
-    assert fake.calls[0][0]["bucket_name"] == "logs"
+def test_store_protected_dev_and_not_sensitive_passes(fake):
+    fake.choice, fake.noul = ("development", 0.9), 0.1
+    props = {"backupRetentionPeriod": 0, "deletionProtection": False, "tags": {"env": "dev"}}
+    assert run(policies.prod_or_sensitive_store_protected, "aws:rds/cluster:Cluster", props) == []
 
 
-# 3
-def test_iam_no_admin_equivalent_reports_escalation_path(fake):
+def test_store_protected_sensitive_without_env_tag_reports(fake):
+    fake.noul = 0.9
+    msgs = run(policies.prod_or_sensitive_store_protected, "aws:s3/bucket:Bucket", {"bucket": "customer-pii-exports"})
+    assert len(msgs) == 1 and "versioning" in msgs[0]
+    assert "env" not in fake.calls[0][1]
+
+
+def test_store_protected_dynamodb_pitr_and_cluster_multi_az_not_required(fake):
+    fake.choice, fake.noul = ("production", 0.9), 0.1
+    assert len(run(policies.prod_or_sensitive_store_protected, "aws:dynamodb/table:Table", {"tags": {"env": "prod"}})) == 1
+    assert run(policies.prod_or_sensitive_store_protected, "aws:dynamodb/table:Table", {"pointInTimeRecovery": {"enabled": True}, "tags": {"env": "prod"}}) == []
+    props = {"backupRetentionPeriod": 7, "deletionProtection": True, "tags": {"env": "prod"}}
+    assert run(policies.prod_or_sensitive_store_protected, "aws:rds/cluster:Cluster", props) == []
+
+
+# 4 iam-no-admin-equivalent
+def test_admin_star_on_star_reported_by_code(fake):
+    pol = doc({"Effect": "Allow", "Action": "*", "Resource": "*"})
+    assert len(run(policies.iam_no_admin_equivalent, "aws:iam/policy:Policy", {"policy": pol})) == 1
+    assert fake.calls == []
+
+
+def test_admin_escalation_path_reported_by_model(fake):
     fake.noul = 0.92
-    pol = statements({"Effect": "Allow", "Action": ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"], "Resource": "*"})
-    msgs = run(policies.iam_no_admin_equivalent, "aws:iam/policy:Policy", {"policy": pol})
+    pol = doc({"Effect": "Allow", "Action": ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"], "Resource": "*"})
+    msgs = run(policies.iam_no_admin_equivalent, "aws:iam/userPolicy:UserPolicy", {"policy": pol})
     assert len(msgs) == 1 and "0.92" in msgs[0]
 
 
-def test_iam_no_admin_equivalent_passes_scoped_policy(fake):
+def test_admin_scoped_policy_passes(fake):
     fake.noul = 0.05
-    pol = statements({"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"})
-    assert run(policies.iam_no_admin_equivalent, "aws:iam/rolePolicy:RolePolicy", {"policy": pol}) == []
+    pol = doc({"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"})
+    assert run(policies.iam_no_admin_equivalent, "aws:iam/groupPolicy:GroupPolicy", {"policy": pol}) == []
 
 
-# 4
-def test_iam_mutating_actions_scoped_reports_wildcard_mutations(fake):
-    fake.noul = 0.9
-    pol = statements({"Effect": "Allow", "Action": ["ec2:TerminateInstances"], "Resource": "*"})
-    msgs = run(policies.iam_mutating_actions_scoped, "aws:iam/policy:Policy", {"policy": pol})
+# 5 iam-grant-matches-stated-purpose
+def test_grant_far_beyond_purpose_reported(fake):
+    fake.score = 1.9
+    pol = doc({"Effect": "Allow", "Action": ["cloudwatch:*", "ec2:*"], "Resource": "*"})
+    props = {"name": "read-metrics", "description": "Read CloudWatch metrics for the dashboard", "policy": pol}
+    msgs = run(policies.iam_grant_matches_stated_purpose, "aws:iam/policy:Policy", props)
     assert len(msgs) == 1
-    assert fake.calls[0][0] == {"actions": ["ec2:TerminateInstances"]}
+    state, questions = fake.calls[0]
+    assert state["policy_name"] == "read-metrics" and state["description"].startswith("Read CloudWatch")
+    assert state["statements"] == json.loads(pol)["Statement"]
+    assert isinstance(questions["fit"], Score)
 
 
-def test_iam_mutating_actions_scoped_skips_when_resources_are_scoped(fake):
-    pol = statements({"Effect": "Allow", "Action": ["ec2:TerminateInstances"], "Resource": "arn:aws:ec2:*:*:instance/i-1"})
-    assert run(policies.iam_mutating_actions_scoped, "aws:iam/policy:Policy", {"policy": pol}) == []
+def test_grant_matching_purpose_passes(fake):
+    fake.score = 0.2
+    pol = doc({"Effect": "Allow", "Action": ["cloudwatch:GetMetricData"], "Resource": "*"})
+    assert run(policies.iam_grant_matches_stated_purpose, "aws:iam/policy:Policy", {"name": "read-metrics", "description": "Read metrics", "policy": pol}) == []
+
+
+def test_grant_role_policy_uses_name_when_no_description(fake):
+    fake.score = 0.5
+    pol = doc({"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "*"})
+    run(policies.iam_grant_matches_stated_purpose, "aws:iam/rolePolicy:RolePolicy", {"policy": pol}, name="artifact-reader")
+    assert fake.calls[0][0]["policy_name"] == "artifact-reader" and fake.calls[0][0]["description"] is None
+
+
+# 6 iam-trust-policy-restricted
+def test_trust_wildcard_without_condition_reported_by_code(fake):
+    trust = doc({"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"})
+    assert len(run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": trust})) == 1
     assert fake.calls == []
 
 
-def test_iam_mutating_actions_scoped_passes_read_only_wildcard(fake):
-    fake.noul = 0.1
-    pol = statements({"Effect": "Allow", "Action": ["ec2:Describe*"], "Resource": ["*"]})
-    assert run(policies.iam_mutating_actions_scoped, "aws:iam/policy:Policy", {"policy": pol}) == []
-
-
-# 5
-def test_iam_trust_policy_restricted_reports_open_trust(fake):
-    fake.noul = 0.97
-    trust = statements({"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"})
-    msgs = run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": trust})
-    assert len(msgs) == 1
-    assert fake.calls[0][0] == {"statements": json.loads(trust)["Statement"]}
-
-
-def test_iam_trust_policy_restricted_passes_service_trust(fake):
-    fake.noul = 0.02
-    trust = statements({"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"})
+def test_trust_service_principal_skips_model(fake):
+    trust = doc({"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"})
     assert run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": trust}) == []
+    assert fake.calls == []
 
 
-# 6
-def test_iam_no_service_users_reports_machine_identity(fake):
+def test_trust_oidc_wildcard_subject_reported_by_model(fake):
+    fake.noul = 0.9
+    stmt = {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com"},
+            "Action": "sts:AssumeRoleWithWebIdentity", "Condition": {"StringLike": {"token.actions.githubusercontent.com:sub": "repo:acme/*:*"}}}
+    msgs = run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": doc(stmt)})
+    assert len(msgs) == 1
+    assert fake.calls[0][0] == {"statements": [stmt]}
+
+
+def test_trust_cross_account_with_external_id_passes(fake):
+    fake.noul = 0.1
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999:root"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"sts:ExternalId": "vendor-42"}}}
+    assert run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": doc(stmt)}) == []
+
+
+# 7 iam-no-service-users
+def test_service_user_reported(fake):
     fake.noul = 0.9
     msgs = run(policies.iam_no_service_users, "aws:iam/user:User", {"name": "ci-deploy-bot"})
-    assert len(msgs) == 1
-    assert fake.calls[0][0] == {"user_name": "ci-deploy-bot"}
+    assert len(msgs) == 1 and fake.calls[0][0] == {"user_name": "ci-deploy-bot"}
 
 
-def test_iam_no_service_users_passes_person(fake):
+def test_person_user_passes(fake):
     fake.noul = 0.1
     assert run(policies.iam_no_service_users, "aws:iam/user:User", {"name": "jane.doe"}) == []
 
 
-# 7
-def test_sg_no_public_admin_ports_reports_public_ssh(fake):
-    fake.noul = 0.96
-    props = {"ingress": [{"fromPort": 22, "toPort": 22, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"], "description": "ssh"}]}
-    msgs = run(policies.sg_no_public_admin_ports, "aws:ec2/securityGroup:SecurityGroup", props)
-    assert len(msgs) == 1 and "22" in msgs[0]
+# 8 sg-rule-matches-description
+SG = "aws:ec2/securityGroup:SecurityGroup"
 
 
-def test_sg_no_public_admin_ports_skips_private_rules(fake):
-    props = {"ingress": [{"fromPort": 22, "toPort": 22, "protocol": "tcp", "cidrBlocks": ["10.0.0.0/8"]}]}
-    assert run(policies.sg_no_public_admin_ports, "aws:ec2/securityGroup:SecurityGroup", props) == []
+def test_sg_rule_broader_than_description_reported(fake):
+    fake.noul = 0.95
+    props = {"ingress": [{"fromPort": 0, "toPort": 65535, "protocol": "-1", "cidrBlocks": ["0.0.0.0/0"], "description": "HTTPS from the ALB"}]}
+    msgs = run(policies.sg_rule_matches_description, SG, props)
+    assert len(msgs) == 1 and "HTTPS from the ALB" in msgs[0]
+
+
+def test_sg_public_rule_without_description_reported_by_code(fake):
+    props = {"ingress": [{"fromPort": 443, "toPort": 443, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"]}]}
+    assert len(run(policies.sg_rule_matches_description, SG, props)) == 1
     assert fake.calls == []
 
 
-def test_sg_no_public_admin_ports_asks_all_public_rules_in_one_request(fake):
-    fake.noul = {"rule_0": 0.95, "rule_1": 0.05}
-    props = {"ingress": [
-        {"fromPort": 3389, "toPort": 3389, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"]},
-        {"fromPort": 443, "toPort": 443, "protocol": "tcp", "ipv6CidrBlocks": ["::/0"]},
-    ]}
-    msgs = run(policies.sg_no_public_admin_ports, "aws:ec2/securityGroup:SecurityGroup", props)
-    assert len(msgs) == 1 and "3389" in msgs[0]
+def test_sg_private_narrow_rule_skips_model(fake):
+    props = {"ingress": [{"fromPort": 443, "toPort": 443, "protocol": "tcp", "cidrBlocks": ["10.0.0.0/8"]}]}
+    assert run(policies.sg_rule_matches_description, SG, props) == []
+    assert fake.calls == []
+
+
+def test_sg_private_broad_rule_with_honest_description_passes(fake):
+    fake.noul = 0.1
+    props = {"ingress": [{"fromPort": 0, "toPort": 0, "protocol": "-1", "cidrBlocks": ["10.0.0.0/8"], "description": "All traffic inside the VPC"}]}
+    assert run(policies.sg_rule_matches_description, SG, props) == []
     assert len(fake.calls) == 1
 
 
-def test_sg_no_public_admin_ports_handles_standalone_ingress_rule(fake):
-    fake.noul = 0.9
-    props = {"type": "ingress", "fromPort": 5432, "toPort": 5432, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"]}
-    assert len(run(policies.sg_no_public_admin_ports, "aws:ec2/securityGroupRule:SecurityGroupRule", props)) == 1
-    assert run(policies.sg_no_public_admin_ports, "aws:ec2/securityGroupRule:SecurityGroupRule", {**props, "type": "egress"}) == []
+def test_sg_rules_fan_out_in_one_request(fake):
+    fake.noul = {"rule_0": 0.9, "rule_1": 0.1}
+    props = {"ingress": [
+        {"fromPort": 0, "toPort": 65535, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"], "description": "SSH for ops"},
+        {"fromPort": 443, "toPort": 443, "protocol": "tcp", "ipv6CidrBlocks": ["::/0"], "description": "Public HTTPS"},
+    ]}
+    msgs = run(policies.sg_rule_matches_description, SG, props)
+    assert len(msgs) == 1 and "SSH for ops" in msgs[0] and len(fake.calls) == 1
 
 
-# 8
-def test_sg_description_meaningful_reports_placeholder(fake):
+def test_sg_vpc_ingress_rule_resource_supported(fake):
+    fake.noul = 0.2
+    props = {"cidrIpv4": "0.0.0.0/0", "fromPort": 22, "toPort": 22, "ipProtocol": "tcp", "description": "SSH from the office"}
+    assert run(policies.sg_rule_matches_description, "aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule", props) == []
+    assert fake.calls[0][0]["rules"][0]["fromPort"] == 22
+
+
+# 9 sg-description-meaningful
+def test_sg_description_placeholder_reported(fake):
     fake.score = 0.2
-    msgs = run(policies.sg_description_meaningful, "aws:ec2/securityGroup:SecurityGroup", {"description": "Managed by Pulumi"})
-    assert len(msgs) == 1
-    assert isinstance(fake.calls[0][1]["quality"], Score)
+    msgs = run(policies.sg_description_meaningful, SG, {"description": "Managed by Pulumi"})
+    assert len(msgs) == 1 and isinstance(fake.calls[0][1]["quality"], Score)
 
 
-def test_sg_description_meaningful_passes_clear_description(fake):
+def test_sg_description_clear_passes(fake):
     fake.score = 1.9
-    assert run(policies.sg_description_meaningful, "aws:ec2/securityGroup:SecurityGroup", {"description": "Allows HTTPS from the ALB to the API pods"}) == []
+    assert run(policies.sg_description_meaningful, SG, {"description": "Allows HTTPS from the ALB to the API service"}) == []
 
 
-# 9
-def test_ec2_no_public_ip_in_prod_reports_prod_public_instance(fake):
-    fake.choice = ("production", 0.9)
-    props = {"associatePublicIpAddress": True, "tags": {"env": "prd"}}
-    assert len(run(policies.ec2_no_public_ip_in_prod, "aws:ec2/instance:Instance", props)) == 1
+# 10 internal-resource-not-public
+def test_internal_ec2_with_public_ip_reported(fake):
+    fake.noul = 0.9
+    msgs = run(policies.internal_resource_not_public, "aws:ec2/instance:Instance", {"associatePublicIpAddress": True, "tags": {"role": "admin"}}, name="admin-console")
+    assert len(msgs) == 1 and fake.calls[0][0]["name"] == "admin-console"
 
 
-def test_ec2_no_public_ip_in_prod_passes_dev_public_instance(fake):
-    fake.choice = ("development", 0.9)
-    props = {"associatePublicIpAddress": True, "tags": {"env": "dev"}}
-    assert run(policies.ec2_no_public_ip_in_prod, "aws:ec2/instance:Instance", props) == []
-
-
-def test_ec2_no_public_ip_in_prod_skips_without_public_ip(fake):
-    assert run(policies.ec2_no_public_ip_in_prod, "aws:ec2/instance:Instance", {"tags": {"env": "prod"}}) == []
+def test_private_ec2_skips_model(fake):
+    assert run(policies.internal_resource_not_public, "aws:ec2/instance:Instance", {"associatePublicIpAddress": False}) == []
     assert fake.calls == []
 
 
-# 10
-def test_rds_prod_not_public_reports_public_prod_db(fake):
-    fake.choice = ("production", 0.95)
-    props = {"publiclyAccessible": True, "tags": {"Environment": "production"}}
-    assert len(run(policies.rds_prod_not_public, "aws:rds/instance:Instance", props)) == 1
+def test_load_balancer_defaults_to_external(fake):
+    fake.noul = 0.9
+    assert len(run(policies.internal_resource_not_public, "aws:lb/loadBalancer:LoadBalancer", {}, name="backoffice-api")) == 1
+    assert run(policies.internal_resource_not_public, "aws:lb/loadBalancer:LoadBalancer", {"internal": True}, name="backoffice-api") == []
 
 
-def test_rds_prod_not_public_skips_private_db(fake):
-    assert run(policies.rds_prod_not_public, "aws:rds/cluster:Cluster", {"publiclyAccessible": False, "tags": {"env": "prod"}}) == []
+def test_function_url_without_auth(fake):
+    fake.noul = 0.9
+    assert len(run(policies.internal_resource_not_public, "aws:lambda/functionUrl:FunctionUrl", {"authorizationType": "NONE", "functionName": "internal-report-generator"})) == 1
+    assert fake.calls[0][0]["name"] == "internal-report-generator"
+    assert run(policies.internal_resource_not_public, "aws:lambda/functionUrl:FunctionUrl", {"authorizationType": "AWS_IAM", "functionName": "x"}) == []
+
+
+def test_public_rds_that_looks_public_facing_passes(fake):
+    fake.noul = 0.1
+    assert run(policies.internal_resource_not_public, "aws:rds/instance:Instance", {"publiclyAccessible": True}, name="public-demo-db") == []
+
+
+# 11 log-and-temp-buckets-have-lifecycle
+def test_log_bucket_without_lifecycle_reported(fake):
+    fake.noul = 0.9
+    assert len(run(policies.log_and_temp_buckets_have_lifecycle, "aws:s3/bucket:Bucket", {"bucket": "alb-access-logs"})) == 1
+
+
+def test_bucket_with_lifecycle_skips_model(fake):
+    assert run(policies.log_and_temp_buckets_have_lifecycle, "aws:s3/bucket:Bucket", {"bucket": "alb-access-logs", "lifecycleRules": [{"enabled": True}]}) == []
     assert fake.calls == []
 
 
-# 11
-def test_rds_prod_backups_and_protection_reports_both_gaps(fake):
-    fake.choice = ("production", 0.9)
-    props = {"backupRetentionPeriod": 1, "deletionProtection": False, "tags": {"env": "prod"}}
-    msgs = run(policies.rds_prod_backups_and_protection, "aws:rds/instance:Instance", props)
-    assert len(msgs) == 2
+def test_durable_bucket_passes(fake):
+    fake.noul = 0.1
+    assert run(policies.log_and_temp_buckets_have_lifecycle, "aws:s3/bucket:Bucket", {"bucket": "customer-uploads"}) == []
 
 
-def test_rds_prod_backups_and_protection_treats_missing_retention_as_default(fake):
-    fake.choice = ("production", 0.9)
-    msgs = run(policies.rds_prod_backups_and_protection, "aws:rds/instance:Instance", {"deletionProtection": True, "tags": {"env": "prod"}})
-    assert len(msgs) == 1 and "backupRetentionPeriod" in msgs[0]
-
-
-def test_rds_prod_backups_and_protection_passes_hardened_prod(fake):
-    fake.choice = ("production", 0.9)
-    props = {"backupRetentionPeriod": 7, "deletionProtection": True, "tags": {"env": "prod"}}
-    assert run(policies.rds_prod_backups_and_protection, "aws:rds/instance:Instance", props) == []
-
-
-def test_rds_prod_backups_and_protection_ignores_non_prod(fake):
-    fake.choice = ("development", 0.9)
-    props = {"backupRetentionPeriod": 0, "deletionProtection": False, "tags": {"env": "dev"}}
-    assert run(policies.rds_prod_backups_and_protection, "aws:rds/instance:Instance", props) == []
-
-
-# 12
-def test_lambda_no_plaintext_secrets_reports_only_flagged_vars(fake):
+# 12 no-plaintext-secrets-in-env
+def test_lambda_env_flags_only_secret_like_vars(fake):
     fake.noul = {"var_0": 0.95, "var_1": 0.03}
     props = {"environment": {"variables": {"DB_PASSWORD": "hunter2hunter2", "LOG_LEVEL": "info"}}}
-    msgs = run(policies.lambda_no_plaintext_secrets, "aws:lambda/function:Function", props)
+    msgs = run(policies.no_plaintext_secrets_in_env, "aws:lambda/function:Function", props)
     assert len(msgs) == 1 and "DB_PASSWORD" in msgs[0]
-
-
-def test_lambda_no_plaintext_secrets_never_sends_values(fake):
-    fake.noul = 0.0
-    props = {"environment": {"variables": {"DB_PASSWORD": "hunter2hunter2"}}}
-    run(policies.lambda_no_plaintext_secrets, "aws:lambda/function:Function", props)
     assert "hunter2" not in json.dumps(fake.calls[0][0])
-    assert fake.calls[0][0]["variables"][0]["name"] == "DB_PASSWORD"
 
 
-def test_lambda_no_plaintext_secrets_skips_without_env(fake):
-    assert run(policies.lambda_no_plaintext_secrets, "aws:lambda/function:Function", {}) == []
+def test_ecs_task_definition_env_parsed_from_json(fake):
+    fake.noul = 0.95
+    containers = json.dumps([{"name": "api", "environment": [{"name": "STRIPE_SECRET_KEY", "value": "sk-live-abc123def456"}]}])
+    msgs = run(policies.no_plaintext_secrets_in_env, "aws:ecs/taskDefinition:TaskDefinition", {"containerDefinitions": containers})
+    assert len(msgs) == 1 and "api" in msgs[0] and "STRIPE_SECRET_KEY" in msgs[0]
+    assert "sk-live" not in json.dumps(fake.calls[0][0])
+
+
+def test_codebuild_skips_secret_store_references(fake):
+    fake.noul = 0.95
+    env = {"environmentVariables": [
+        {"name": "GITHUB_TOKEN", "value": "ghp_abcdefghijklmnop", "type": "PLAINTEXT"},
+        {"name": "NPM_TOKEN", "value": "/build/npm-token", "type": "PARAMETER_STORE"},
+    ]}
+    msgs = run(policies.no_plaintext_secrets_in_env, "aws:codebuild/project:Project", {"environment": env})
+    assert len(msgs) == 1 and "GITHUB_TOKEN" in msgs[0]
+    assert len(fake.calls[0][0]["variables"]) == 1
+
+
+def test_no_env_skips_model(fake):
+    assert run(policies.no_plaintext_secrets_in_env, "aws:lambda/function:Function", {}) == []
     assert fake.calls == []
 
 
-# 13
-def test_tags_owner_is_real_reports_placeholder(fake):
-    fake.noul = 0.9
-    msgs = run(policies.tags_owner_is_real, "aws:s3/bucket:Bucket", {"tags": {"owner": "todo"}})
-    assert len(msgs) == 1 and "todo" in msgs[0]
+# 13 tags-meaningful
+def test_tags_meaningful_reports_each_bad_tag_from_one_request(fake):
+    fake.noul, fake.choice = {"owner": 0.9, "cost_center": 0.9}, ("unknown", 0.9)
+    msgs = run(policies.tags_meaningful, "aws:s3/bucket:Bucket", {"tags": {"owner": "todo", "env": "banana", "cost-center": "n/a"}})
+    assert len(msgs) == 3 and len(fake.calls) == 1
 
 
-def test_tags_owner_is_real_passes_real_owner(fake):
-    fake.noul = 0.05
-    assert run(policies.tags_owner_is_real, "aws:s3/bucket:Bucket", {"tags": {"Owner": "platform-team"}}) == []
+def test_tags_meaningful_good_tags_pass(fake):
+    fake.noul, fake.choice = 0.1, ("production", 0.9)
+    assert run(policies.tags_meaningful, "aws:s3/bucket:Bucket", {"tags": {"Owner": "platform-team", "Environment": "prod"}}) == []
 
 
-def test_tags_owner_is_real_skips_missing_owner_and_control_plane(fake):
-    assert run(policies.tags_owner_is_real, "aws:s3/bucket:Bucket", {"tags": {"env": "prod"}}) == []
-    assert run(policies.tags_owner_is_real, "pulumiservice:index:Stack", {"tags": {"owner": "todo"}}) == []
-    assert fake.calls == []
-
-
-# 14
-def test_tags_env_recognized_reports_unknown(fake):
-    fake.choice = ("unknown", 0.8)
-    assert len(run(policies.tags_env_recognized, "aws:s3/bucket:Bucket", {"tags": {"env": "banana"}})) == 1
-
-
-def test_tags_env_recognized_reports_low_confidence(fake):
+def test_tags_meaningful_low_confidence_env_reported(fake):
     fake.choice = ("staging", 0.4)
-    assert len(run(policies.tags_env_recognized, "aws:s3/bucket:Bucket", {"tags": {"env": "p"}})) == 1
+    assert len(run(policies.tags_meaningful, "aws:s3/bucket:Bucket", {"tags": {"env": "p"}})) == 1
 
 
-def test_tags_env_recognized_passes_clear_env(fake):
-    fake.choice = ("production", 0.95)
-    assert run(policies.tags_env_recognized, "aws:s3/bucket:Bucket", {"tags": {"env": "prod"}}) == []
-
-
-def test_tags_env_recognized_skips_without_env_tag(fake):
-    assert run(policies.tags_env_recognized, "aws:s3/bucket:Bucket", {"tags": {"owner": "x"}}) == []
+def test_tags_meaningful_skips_without_relevant_tags_or_on_control_plane(fake):
+    assert run(policies.tags_meaningful, "aws:s3/bucket:Bucket", {"tags": {"team": "x"}}) == []
+    assert run(policies.tags_meaningful, "pulumiservice:index:Stack", {"tags": {"owner": "todo"}}) == []
     assert fake.calls == []
 
 
-# 15
-def test_resource_name_descriptive_reports_placeholder_name(fake):
+# 14 name-consistent-with-config
+def test_name_env_contradicts_tag_reported(fake):
+    fake.choice = {"name_env": ("production", 0.9), "tag_env": ("development", 0.9)}
+    msgs = run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"env": "dev"}}, name="prod-orders-db")
+    assert len(msgs) == 1 and "prod-orders-db" in msgs[0]
+
+
+def test_name_without_env_hint_passes(fake):
+    fake.choice = {"name_env": ("none", 0.9), "tag_env": ("development", 0.9)}
+    assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"env": "dev"}}, name="orders-db") == []
+
+
+def test_name_env_agrees_or_uncertain_passes(fake):
+    fake.choice = {"name_env": ("production", 0.9), "tag_env": ("production", 0.9)}
+    assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"env": "prod"}}, name="prod-orders-db") == []
+    fake.choice = {"name_env": ("production", 0.4), "tag_env": ("development", 0.9)}
+    assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"env": "dev"}}, name="prd-orders-db") == []
+
+
+def test_name_without_env_tag_skips_model(fake):
+    assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"owner": "x"}}, name="prod-orders-db") == []
+    assert fake.calls == []
+
+
+# 15 sqs-work-queue-has-dlq
+def test_work_queue_without_dlq_reported(fake):
     fake.noul = 0.9
-    msgs = run(policies.resource_name_descriptive, "aws:s3/bucket:Bucket", {}, name="test123")
-    assert len(msgs) == 1 and "test123" in msgs[0]
-    assert fake.calls[0][0] == {"resource_type": "aws:s3/bucket:Bucket", "name": "test123"}
+    assert len(run(policies.sqs_work_queue_has_dlq, "aws:sqs/queue:Queue", {"name": "order-processing"})) == 1
 
 
-def test_resource_name_descriptive_skips_stack_and_providers(fake):
-    assert run(policies.resource_name_descriptive, "pulumi:pulumi:Stack", {}, name="x") == []
-    assert run(policies.resource_name_descriptive, "pulumi:providers:aws", {}, name="default") == []
+def test_queue_with_redrive_skips_model(fake):
+    assert run(policies.sqs_work_queue_has_dlq, "aws:sqs/queue:Queue", {"name": "order-processing", "redrivePolicy": "{}"}) == []
     assert fake.calls == []
+
+
+def test_dead_letter_queue_itself_passes(fake):
+    fake.noul = 0.1
+    assert run(policies.sqs_work_queue_has_dlq, "aws:sqs/queue:Queue", {"name": "order-processing-dlq"}) == []
 
 
 # registry
 def test_registry_has_fifteen_unique_documented_policies():
     names = [p.name for p in policies.POLICIES]
-    assert len(names) == 15 and len(set(names)) == len(names)
+    assert len(names) == 15 and len(set(names)) == 15
     for p in policies.POLICIES:
         assert p.validate.__doc__
         assert isinstance(p.enforcement, EnforcementLevel)
