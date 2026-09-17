@@ -4,7 +4,9 @@ Code decides every case it can decide exactly. The model only gets the gray zone
 consistency between fields, and whether a condition or description means what it claims.
 """
 import json
+import re
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from typing import Callable, NamedTuple
 
 from pulumi_policy import EnforcementLevel, Severity
@@ -50,10 +52,20 @@ def _tag(tags, key):
     return next(((k, v) for k, v in tags.items() if k.lower() == key), (None, None))
 
 
+def _display_name(args, *keys):
+    physical = next((args.props.get(k) for k in keys if args.props.get(k)), None)
+    if not physical or re.fullmatch(re.escape(args.name) + r"-?[0-9a-f]{7}", physical):
+        return args.name
+    return physical
+
+
 def _identity(args):
-    p = args.props
-    name = p.get("name") or p.get("bucket") or p.get("identifier") or p.get("functionName") or args.name
-    return {"resource_type": args.resource_type, "name": name, "tags": judge.plain(_tags(args) or {}), "description": p.get("description")}
+    name = _display_name(args, "functionName", "name", "bucket", "identifier")
+    return {"resource_type": args.resource_type, "name": name, "tags": judge.plain(_tags(args) or {}), "description": args.props.get("description")}
+
+
+def _port(value):
+    return int(value) if isinstance(value, float) and value.is_integer() else value
 
 
 def _wildcard_principal(stmt):
@@ -168,25 +180,78 @@ def prod_or_sensitive_store_protected(args, report):
 
 
 # 4
+ESCALATION_CATALOG = {
+    "iam:PassRole": "pass-role",
+    "lambda:CreateFunction": "create-compute", "lambda:UpdateFunctionCode": "create-compute", "lambda:UpdateFunctionConfiguration": "create-compute",
+    "ec2:RunInstances": "create-compute", "ecs:RunTask": "create-compute", "ecs:RegisterTaskDefinition": "create-compute",
+    "glue:CreateDevEndpoint": "create-compute", "glue:CreateJob": "create-compute", "glue:UpdateJob": "create-compute",
+    "cloudformation:CreateStack": "create-compute", "cloudformation:UpdateStack": "create-compute",
+    "codebuild:CreateProject": "create-compute", "codebuild:UpdateProject": "create-compute",
+    "sagemaker:CreateNotebookInstance": "create-compute", "sagemaker:CreateTrainingJob": "create-compute", "sagemaker:CreateProcessingJob": "create-compute",
+    "datapipeline:CreatePipeline": "create-compute", "datapipeline:PutPipelineDefinition": "create-compute",
+    "iam:CreatePolicyVersion": "write-policy", "iam:SetDefaultPolicyVersion": "activate-policy",
+    "iam:AttachUserPolicy": "attach-policy", "iam:AttachRolePolicy": "attach-policy", "iam:AttachGroupPolicy": "attach-policy",
+    "iam:PutUserPolicy": "attach-policy", "iam:PutRolePolicy": "attach-policy", "iam:PutGroupPolicy": "attach-policy",
+    "iam:UpdateAssumeRolePolicy": "attach-policy", "iam:AddUserToGroup": "attach-policy",
+    "iam:CreateAccessKey": "create-credentials", "iam:CreateLoginProfile": "create-credentials", "iam:UpdateLoginProfile": "create-credentials",
+}
+ESCALATION_CHAINS = ({"pass-role", "create-compute"}, {"write-policy", "activate-policy"}, {"attach-policy"}, {"create-credentials"})
+CATALOG_SERVICES = {a.split(":")[0] for a in ESCALATION_CATALOG}
+
+
+def _matches(action, patterns):
+    return any(fnmatchcase(action.lower(), p.lower()) for p in patterns)
+
+
+def _broad_allow_statements(stmts):
+    return [s for s in stmts if s.get("Effect") == "Allow" and "*" in _as_list(s.get("Resource"))]
+
+
+def _capabilities(stmts):
+    caps = set()
+    for stmt in _broad_allow_statements(stmts):
+        for action, cap in ESCALATION_CATALOG.items():
+            if "NotAction" in stmt:
+                if not _matches(action, _as_list(stmt["NotAction"])):
+                    caps.add(cap)
+            elif _matches(action, _as_list(stmt.get("Action"))):
+                caps.add(cap)
+    return caps
+
+
+def _unknown_wildcard_services(stmts):
+    services = set()
+    for stmt in _broad_allow_statements(stmts):
+        for pattern in _as_list(stmt.get("Action")):
+            service, _, rest = pattern.partition(":")
+            if rest == "*" and service != "*" and service not in CATALOG_SERVICES:
+                services.add(service)
+    return sorted(services)
+
+
 def iam_no_admin_equivalent(args, report):
     """IAM policies must not grant administrator-equivalent access, directly or through an escalation path."""
     if args.resource_type not in IAM_POLICY_TYPES:
         return
     stmts = _statements(args.props["policy"])
-    for stmt in stmts:
-        if stmt.get("Effect") == "Allow" and any(a in ("*", "*:*") for a in _as_list(stmt.get("Action"))) and "*" in _as_list(stmt.get("Resource")):
-            report("policy allows every action on every resource")
+    caps = _capabilities(stmts)
+    for chain in ESCALATION_CHAINS:
+        if chain <= caps:
+            report(f"policy grants a privilege escalation chain: {' + '.join(sorted(chain))} on every resource")
             return
+    services = _unknown_wildcard_services(stmts)
+    if "pass-role" not in caps or not services:
+        return
     p = judge.noul(
-        {"statements": stmts},
-        "Do the permissions in `statements` let the holder gain full control of the AWS account by chaining the allowed actions?",
+        {"services": services, "holder_also_has": "iam:PassRole on every role"},
+        "Can any service in `services` create or run compute, jobs, notebooks, functions, or stacks that execute under an IAM role passed to it with iam:PassRole?",
         NoulCriteria(
-            true="Allows iam:* or an equivalent, or a known escalation path such as iam:PassRole together with creating or running compute (Lambda, EC2, ECS, Glue, CloudFormation), creating access keys or login profiles for other identities, attaching or putting IAM policies, or creating and setting IAM policy versions",
-            false="Permissions stay within specific services and cannot be combined to obtain broader IAM access",
+            true="At least one listed service launches code or jobs that assume a passed role, such as Lambda, EC2, ECS, Batch, Glue, SageMaker, CodeBuild, CloudFormation, Data Pipeline, EMR, or EKS",
+            false="None of the listed services execute code or jobs under a passed role; they only store data, route traffic, or manage DNS, billing, or monitoring",
         ),
     )
-    if p >= judge.HIGH:
-        report(f"policy contains a privilege escalation path {_percent(p)}")
+    if p >= judge.DEFAULT:
+        report(f"iam:PassRole plus full access to {', '.join(services)} can run code under any role {_percent(p)}")
 
 
 # 5
@@ -195,7 +260,7 @@ def iam_grant_matches_stated_purpose(args, report):
     if args.resource_type not in IAM_POLICY_TYPES:
         return
     state = {
-        "policy_name": args.props.get("name") or args.name,
+        "policy_name": _display_name(args, "name"),
         "description": args.props.get("description"),
         "tags": judge.plain(_tags(args) or {}),
         "statements": _statements(args.props["policy"]),
@@ -218,6 +283,20 @@ def iam_grant_matches_stated_purpose(args, report):
 
 
 # 6
+RESTRICTING_CONDITION_KEYS = {"sts:externalid", "aws:principalorgid", "aws:principalarn", "aws:sourcearn", "aws:sourceaccount", "aws:principalaccount"}
+ACCOUNT_WIDE = re.compile(r"^(\d{12}|arn:aws:iam::\d{12}:root)$")
+
+
+def _condition_keys(stmt):
+    return [k for op in (stmt.get("Condition") or {}).values() for k in op]
+
+
+def _trust_digest(stmt):
+    principal = stmt.get("Principal") or {}
+    kind = "federated" if "Federated" in principal else "aws-account" if any(ACCOUNT_WIDE.match(a) for a in _as_list(principal.get("AWS"))) else "aws-identity"
+    return {"principal_kind": kind, "principal": principal, "condition_keys": _condition_keys(stmt), "condition": stmt.get("Condition") or {}}
+
+
 def iam_trust_policy_restricted(args, report):
     """IAM role trust policies must pin who can assume the role, including federated subjects and cross-account conditions."""
     if args.resource_type != IAM_ROLE or not args.props.get("assumeRolePolicy"):
@@ -227,20 +306,25 @@ def iam_trust_policy_restricted(args, report):
         if stmt.get("Effect") != "Allow":
             continue
         principal = stmt.get("Principal")
+        if not isinstance(principal, Mapping) and principal != "*":
+            continue
+        restricting = {k.lower() for k in _condition_keys(stmt)} & RESTRICTING_CONDITION_KEYS
         if _wildcard_principal(stmt) and not stmt.get("Condition"):
             report("trust policy lets every principal assume the role with no Condition")
-        elif isinstance(principal, Mapping) and set(principal) == {"Service"}:
             continue
-        else:
-            gray.append(stmt)
+        digest = _trust_digest(stmt)
+        if digest["principal_kind"] == "aws-account" and not restricting:
+            report("trust policy lets every identity in another account assume the role without sts:ExternalId, aws:PrincipalArn, or an organization condition")
+        elif digest["principal_kind"] == "federated" or _wildcard_principal(stmt) or restricting:
+            gray.append(digest)
     if not gray:
         return
     questions = {
         f"stmt_{i}": Noul(
-            instructions=f"Does `statements[{i}]` let principals beyond one intended workload or identity assume this role?",
+            instructions=f"Given `statements[{i}].principal_kind`, `principal`, and `condition`, can identities beyond one specific workload or one named role assume this role?",
             criteria=NoulCriteria(
-                true="An AWS account or role from another account with no sts:ExternalId or organization condition, a Federated OIDC or SAML principal whose conditions use wildcards that match many repositories, branches, or subjects (for example sub: repo:org/*:*), or conditions that do not constrain identity",
-                false="A single account or role with an ExternalId or organization condition, or a Federated principal pinned to a specific audience and subject such as one repository and one branch",
+                true="A federated condition uses a wildcard that matches many repositories, branches, subjects, or users (for example sub: repo:org/*:*), or an AWS principal's condition value is a wildcard that matches many roles or accounts",
+                false="The condition pins one repository and branch, one subject, one audience with one subject, one sts:ExternalId, one organization, or one named role ARN",
             ),
         )
         for i in range(len(gray))
@@ -257,7 +341,7 @@ def iam_no_service_users(args, report):
     """IAM users are for people. Machine and service identities should use roles."""
     if args.resource_type != IAM_USER:
         return
-    user_name = args.props.get("name") or args.name
+    user_name = _display_name(args, "name")
     p = judge.noul(
         {"user_name": user_name},
         "Does `user_name` identify a machine, service, application, pipeline, or bot rather than a person?",
@@ -274,18 +358,22 @@ def iam_no_service_users(args, report):
 def _ingress_rules(args):
     t, p = args.resource_type, args.props
     if t == SG:
-        return [judge.plain(r) for r in p.get("ingress") or []]
-    if t == SG_RULE and p.get("type") == "ingress":
-        return [judge.plain(p)]
-    if t == VPC_INGRESS_RULE:
+        rules = [judge.plain(r) for r in p.get("ingress") or []]
+    elif t == SG_RULE and p.get("type") == "ingress":
+        rules = [judge.plain(p)]
+    elif t == VPC_INGRESS_RULE:
         p = judge.plain(p)
-        return [{
+        rules = [{
             "fromPort": p.get("fromPort"), "toPort": p.get("toPort"), "protocol": p.get("ipProtocol"),
             "cidrBlocks": [p["cidrIpv4"]] if p.get("cidrIpv4") else [],
             "ipv6CidrBlocks": [p["cidrIpv6"]] if p.get("cidrIpv6") else [],
             "description": p.get("description"),
         }]
-    return []
+    else:
+        return []
+    for r in rules:
+        r["fromPort"], r["toPort"] = _port(r.get("fromPort")), _port(r.get("toPort"))
+    return rules
 
 
 def _sources(rule):
@@ -492,6 +580,7 @@ def tags_meaningful(args, report):
 
 # 14
 NAME_ENV_CRITERIA = {k: v for k, v in judge.ENV_CRITERIA.items() if k != "unknown"} | {"none": "The name carries no environment hint"}
+ENV_CLASS = {"production": "production", "staging": "staging", "development": "non-production", "test": "non-production"}
 
 
 def name_consistent_with_config(args, report):
@@ -515,7 +604,7 @@ def name_consistent_with_config(args, report):
         return
     if by_name.confidence < ENV_CONFIDENCE or by_tag.confidence < ENV_CONFIDENCE:
         return
-    if by_name.choice != by_tag.choice:
+    if ENV_CLASS[by_name.choice] != ENV_CLASS[by_tag.choice]:
         report(f"name '{name}' implies {by_name.choice} but the environment tag '{env[1]}' reads as {by_tag.choice}")
 
 

@@ -36,7 +36,8 @@ def test_plain_leaves_strings_and_scalars_alone():
     assert judge.plain(None) is None
 
 
-def test_ask_raises_clear_error_without_api_key():
+def test_ask_raises_clear_error_without_api_key(monkeypatch):
+    monkeypatch.setattr(judge, "load_dotenv", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="TYPESAFE_API_KEY"):
         judge.ask({"a": 1}, {"q": Noul(instructions="Is a one?")})
 

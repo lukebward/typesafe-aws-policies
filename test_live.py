@@ -12,6 +12,7 @@ import pytest
 import judge
 import policies
 
+judge.load_dotenv()
 pytestmark = pytest.mark.skipif(not os.environ.get("TYPESAFE_API_KEY"), reason="TYPESAFE_API_KEY not set")
 
 
@@ -51,6 +52,10 @@ CASES = [
      {"policy": doc({"Effect": "Allow", "Action": ["iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"], "Resource": "*"})}, True),
     ("iam-no-admin-equivalent", "aws:iam/policy:Policy",
      {"policy": doc({"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "arn:aws:s3:::b/*"})}, False),
+    ("iam-no-admin-equivalent", "aws:iam/policy:Policy",
+     {"policy": doc({"Effect": "Allow", "Action": ["iam:PassRole", "batch:*"], "Resource": "*"})}, True),
+    ("iam-no-admin-equivalent", "aws:iam/policy:Policy",
+     {"policy": doc({"Effect": "Allow", "Action": ["iam:PassRole", "route53:*"], "Resource": "*"})}, False),
     # 5 iam-grant-matches-stated-purpose
     ("iam-grant-matches-stated-purpose", "aws:iam/policy:Policy",
      {"name": "read-metrics", "description": "Read CloudWatch metrics for the ops dashboard",
@@ -67,7 +72,11 @@ CASES = [
                                "Condition": {"StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
                                                               "token.actions.githubusercontent.com:sub": "repo:acme/shop:ref:refs/heads/main"}}})}, False),
     ("iam-trust-policy-restricted", "aws:iam/role:Role",
-     {"assumeRolePolicy": doc({"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole"})}, True),
+     {"assumeRolePolicy": doc({"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole",
+                               "Condition": {"Bool": {"aws:SecureTransport": "true"}}})}, True),
+    ("iam-trust-policy-restricted", "aws:iam/role:Role",
+     {"assumeRolePolicy": doc({"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole",
+                               "Condition": {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::999999999999:role/*"}}})}, True),
     ("iam-trust-policy-restricted", "aws:iam/role:Role",
      {"assumeRolePolicy": doc({"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole",
                                "Condition": {"StringEquals": {"sts:ExternalId": "vendor-42"}}})}, False),
@@ -117,7 +126,8 @@ BY_NAME = {rule.name: rule.validate for rule in policies.POLICIES}
 def test_policy_against_live_model(policy_name, resource_type, props, expect_violation):
     judge._cache.clear()
     out = []
-    args = SimpleNamespace(resource_type=resource_type, props=MappingProxyType(props), name=props.get("name", "res"), urn="urn::res")
+    name = props.get("name") or props.get("bucket") or props.get("identifier") or "res"
+    args = SimpleNamespace(resource_type=resource_type, props=MappingProxyType(props), name=name, urn="urn::res")
     BY_NAME[policy_name](args, lambda m, urn=None: out.append(m))
     print(f"\n{policy_name}: {out or 'no violation'}")
     assert bool(out) == expect_violation, out

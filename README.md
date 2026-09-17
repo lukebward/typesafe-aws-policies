@@ -43,9 +43,9 @@ Code decides every case it can decide exactly. The model only gets the gray zone
 | resource-policy-not-open | S3, KMS, SQS, SNS, Secrets Manager policies | wildcard principal with no Condition is a violation outright | when a Condition exists: does it restrict who can call (PrincipalOrgID yes, SecureTransport no) |
 | sensitive-data-store-encrypted | S3, RDS, DynamoDB, EBS, EFS | the per-type encryption field | do name, tags, description indicate sensitive data |
 | prod-or-sensitive-store-protected | RDS, S3, DynamoDB | backups, deletion protection, multi-AZ, versioning, PITR | is this production, is this sensitive (one request, two questions) |
-| iam-no-admin-equivalent | IAM policies | `Action: *` on `Resource: *` outright | privilege escalation chains such as PassRole plus compute, or policy version edits |
+| iam-no-admin-equivalent | IAM policies | known escalation chains from an action catalog (PassRole plus compute, policy version edits, attach policy, create credentials), wildcards and NotAction included | whether an unlisted service wildcard, combined with PassRole, can run code under a passed role |
 | iam-grant-matches-stated-purpose | IAM policies | none | Score: does the grant match the name and description, go somewhat beyond, or far beyond |
-| iam-trust-policy-restricted | IAM roles | `Principal: *` with no Condition outright; plain service principals skipped | do conditions restrict enough, including OIDC `sub` wildcards like `repo:org/*:*` |
+| iam-trust-policy-restricted | IAM roles | `Principal: *` with no Condition, and account-wide principals without ExternalId, PrincipalArn, or org conditions, outright; service principals and named roles skipped | federated subject breadth (OIDC `sub` wildcards like `repo:org/*:*`) and whether conditioned principals are really pinned |
 | iam-no-service-users | IAM users | none | does the user name identify a machine rather than a person |
 | sg-rule-matches-description | security groups and ingress rules | rule is public or broad; missing description is a violation outright | does the rule allow substantially more than its description claims |
 | sg-description-meaningful | security groups | none | Score on description quality |
@@ -72,4 +72,5 @@ Security policies are MANDATORY. Hygiene policies (purpose fit, names, descripti
 - Jev reads instructions literally and is weak at arithmetic, dates, and counting. Those checks stay in code.
 - The dummy AWS keys satisfy the provider's credential chain; `aws:skipCredentialsValidation` in `Pulumi.dev.yaml` stops it from calling AWS.
 - The S3 checks read the inline `serverSideEncryptionConfiguration`, `versioning`, and `lifecycleRules` inputs on `aws.s3.Bucket`. Stacks that use the separate configuration resources need a stack-level policy instead.
-- Thresholds live in `judge.py` (`DEFAULT = 0.8`, `HIGH = 0.85`). Tune them on real previews.
+- Thresholds live in `judge.py` (`DEFAULT = 0.8`, `HIGH = 0.85`). On the live run every intended violation scored 0.85 or higher and every intended pass scored 0.20 or lower.
+- Give the model pre-digested facts, not raw JSON. Raw IAM statements scored 0.52 to 0.59 on escalation chains; the same cases scored 0.81 to 0.98 once code extracted the relevant actions and principal kinds.

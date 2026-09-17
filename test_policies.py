@@ -97,7 +97,8 @@ def test_resource_policy_covers_kms_sqs_sns_secrets(fake):
 # 2 sensitive-data-store-encrypted
 def test_sensitive_store_unencrypted_rds_reported(fake):
     fake.noul = 0.9
-    msgs = run(policies.sensitive_data_store_encrypted, "aws:rds/instance:Instance", {"identifier": "customer-pii-db", "storageEncrypted": False, "tags": {"team": "data"}})
+    props = {"identifier": "customer-pii-db-7f3a1c2", "storageEncrypted": False, "tags": {"team": "data"}}
+    msgs = run(policies.sensitive_data_store_encrypted, "aws:rds/instance:Instance", props, name="customer-pii-db")
     assert len(msgs) == 1
     state = fake.calls[0][0]
     assert state["resource_type"] == "aws:rds/instance:Instance" and state["name"] == "customer-pii-db" and state["tags"] == {"team": "data"}
@@ -160,23 +161,46 @@ def test_store_protected_dynamodb_pitr_and_cluster_multi_az_not_required(fake):
 
 
 # 4 iam-no-admin-equivalent
+IAM_POLICY = "aws:iam/policy:Policy"
+
+
 def test_admin_star_on_star_reported_by_code(fake):
     pol = doc({"Effect": "Allow", "Action": "*", "Resource": "*"})
-    assert len(run(policies.iam_no_admin_equivalent, "aws:iam/policy:Policy", {"policy": pol})) == 1
+    assert len(run(policies.iam_no_admin_equivalent, IAM_POLICY, {"policy": pol})) == 1
     assert fake.calls == []
 
 
-def test_admin_escalation_path_reported_by_model(fake):
-    fake.noul = 0.92
-    pol = doc({"Effect": "Allow", "Action": ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"], "Resource": "*"})
-    msgs = run(policies.iam_no_admin_equivalent, "aws:iam/userPolicy:UserPolicy", {"policy": pol})
-    assert len(msgs) == 1 and "0.92" in msgs[0]
+def test_admin_known_escalation_chains_reported_by_code(fake):
+    passrole_compute = doc({"Effect": "Allow", "Action": ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction"], "Resource": "*"})
+    policy_versions = doc({"Effect": "Allow", "Action": ["iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion"], "Resource": "*"})
+    iam_wildcard = doc({"Effect": "Allow", "Action": "iam:*", "Resource": "*"})
+    not_action = doc({"Effect": "Allow", "NotAction": ["s3:*"], "Resource": "*"})
+    for pol in (passrole_compute, policy_versions, iam_wildcard, not_action):
+        assert len(run(policies.iam_no_admin_equivalent, "aws:iam/userPolicy:UserPolicy", {"policy": pol})) == 1, pol
+    assert fake.calls == []
 
 
-def test_admin_scoped_policy_passes(fake):
-    fake.noul = 0.05
-    pol = doc({"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"})
-    assert run(policies.iam_no_admin_equivalent, "aws:iam/groupPolicy:GroupPolicy", {"policy": pol}) == []
+def test_admin_passrole_with_unknown_service_wildcard_asks_model(fake):
+    fake.noul = 0.9
+    pol = doc({"Effect": "Allow", "Action": ["iam:PassRole", "batch:*"], "Resource": "*"})
+    msgs = run(policies.iam_no_admin_equivalent, IAM_POLICY, {"policy": pol})
+    assert len(msgs) == 1 and "batch" in msgs[0]
+    assert fake.calls[0][0]["services"] == ["batch"]
+
+
+def test_admin_passrole_with_harmless_service_passes(fake):
+    fake.noul = 0.1
+    pol = doc({"Effect": "Allow", "Action": ["iam:PassRole", "route53:*"], "Resource": "*"})
+    assert run(policies.iam_no_admin_equivalent, IAM_POLICY, {"policy": pol}) == []
+    assert len(fake.calls) == 1
+
+
+def test_admin_compute_without_passrole_and_scoped_policies_skip_model(fake):
+    for pol in (doc({"Effect": "Allow", "Action": "lambda:*", "Resource": "*"}),
+                doc({"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::b/*"}),
+                doc({"Effect": "Allow", "Action": ["iam:PassRole", "lambda:CreateFunction"], "Resource": "arn:aws:iam::1:role/one"})):
+        assert run(policies.iam_no_admin_equivalent, "aws:iam/groupPolicy:GroupPolicy", {"policy": pol}) == [], pol
+    assert fake.calls == []
 
 
 # 5 iam-grant-matches-stated-purpose
@@ -206,31 +230,52 @@ def test_grant_role_policy_uses_name_when_no_description(fake):
 
 
 # 6 iam-trust-policy-restricted
+ROLE = "aws:iam/role:Role"
+GITHUB = "arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com"
+
+
 def test_trust_wildcard_without_condition_reported_by_code(fake):
     trust = doc({"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"})
-    assert len(run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": trust})) == 1
+    assert len(run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": trust})) == 1
     assert fake.calls == []
 
 
 def test_trust_service_principal_skips_model(fake):
     trust = doc({"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"})
-    assert run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": trust}) == []
+    assert run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": trust}) == []
+    assert fake.calls == []
+
+
+def test_trust_account_wide_principal_without_restricting_condition_reported_by_code(fake):
+    for principal, cond in (("arn:aws:iam::999999999999:root", None), ("999999999999", None), ("arn:aws:iam::999999999999:root", {"Bool": {"aws:SecureTransport": "true"}})):
+        stmt = {"Effect": "Allow", "Principal": {"AWS": principal}, "Action": "sts:AssumeRole"}
+        if cond:
+            stmt["Condition"] = cond
+        assert len(run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)})) == 1, principal
+    assert fake.calls == []
+
+
+def test_trust_named_role_principal_without_condition_passes_without_model(fake):
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999:role/deployer"}, "Action": "sts:AssumeRole"}
+    assert run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)}) == []
     assert fake.calls == []
 
 
 def test_trust_oidc_wildcard_subject_reported_by_model(fake):
     fake.noul = 0.9
-    stmt = {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com"},
-            "Action": "sts:AssumeRoleWithWebIdentity", "Condition": {"StringLike": {"token.actions.githubusercontent.com:sub": "repo:acme/*:*"}}}
-    msgs = run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": doc(stmt)})
+    stmt = {"Effect": "Allow", "Principal": {"Federated": GITHUB}, "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {"StringLike": {"token.actions.githubusercontent.com:sub": "repo:acme/*:*"}}}
+    msgs = run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)})
     assert len(msgs) == 1
-    assert fake.calls[0][0] == {"statements": [stmt]}
+    state = fake.calls[0][0]["statements"][0]
+    assert state["principal_kind"] == "federated" and state["condition_keys"] == ["token.actions.githubusercontent.com:sub"]
 
 
-def test_trust_cross_account_with_external_id_passes(fake):
+def test_trust_cross_account_with_external_id_goes_to_model_and_passes(fake):
     fake.noul = 0.1
-    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999:root"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"sts:ExternalId": "vendor-42"}}}
-    assert run(policies.iam_trust_policy_restricted, "aws:iam/role:Role", {"assumeRolePolicy": doc(stmt)}) == []
+    stmt = {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::999999999999:root"}, "Action": "sts:AssumeRole", "Condition": {"StringEquals": {"sts:ExternalId": "vendor-42"}}}
+    assert run(policies.iam_trust_policy_restricted, ROLE, {"assumeRolePolicy": doc(stmt)}) == []
+    assert fake.calls[0][0]["statements"][0]["principal_kind"] == "aws-account"
 
 
 # 7 iam-no-service-users
@@ -290,6 +335,12 @@ def test_sg_vpc_ingress_rule_resource_supported(fake):
     props = {"cidrIpv4": "0.0.0.0/0", "fromPort": 22, "toPort": 22, "ipProtocol": "tcp", "description": "SSH from the office"}
     assert run(policies.sg_rule_matches_description, "aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule", props) == []
     assert fake.calls[0][0]["rules"][0]["fromPort"] == 22
+
+
+def test_sg_float_ports_are_rendered_as_integers(fake):
+    props = {"ingress": [{"fromPort": 22.0, "toPort": 22.0, "protocol": "tcp", "cidrBlocks": ["0.0.0.0/0"]}]}
+    msgs = run(policies.sg_rule_matches_description, SG, props)
+    assert "22-22" in msgs[0] and "22.0" not in msgs[0]
 
 
 # 9 sg-description-meaningful
@@ -425,6 +476,11 @@ def test_name_env_agrees_or_uncertain_passes(fake):
     assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"env": "dev"}}, name="prd-orders-db") == []
 
 
+def test_name_dev_and_test_are_compatible(fake):
+    fake.choice = {"name_env": ("test", 0.9), "tag_env": ("development", 0.9)}
+    assert run(policies.name_consistent_with_config, "aws:ebs/volume:Volume", {"tags": {"env": "dev"}}, name="ci-scratch") == []
+
+
 def test_name_without_env_tag_skips_model(fake):
     assert run(policies.name_consistent_with_config, "aws:rds/instance:Instance", {"tags": {"owner": "x"}}, name="prod-orders-db") == []
     assert fake.calls == []
@@ -454,3 +510,24 @@ def test_registry_has_fifteen_unique_documented_policies():
         assert p.validate.__doc__
         assert isinstance(p.enforcement, EnforcementLevel)
         assert isinstance(p.severity, Severity)
+
+
+# display names: explicit physical names are honored, Pulumi auto-names fall back to the logical name
+def test_display_name_prefers_explicit_physical_name(fake):
+    fake.noul = 0.9
+    msgs = run(policies.iam_no_service_users, "aws:iam/user:User", {"name": "deploy.bot"}, name="ci-user")
+    assert "deploy.bot" in msgs[0]
+
+
+def test_display_name_strips_pulumi_autoname_suffix(fake):
+    fake.noul = 0.9
+    msgs = run(policies.iam_no_service_users, "aws:iam/user:User", {"name": "ci-deploy-bot-f5676fc"}, name="ci-deploy-bot")
+    assert "ci-deploy-bot" in msgs[0] and "f5676fc" not in msgs[0]
+    assert fake.calls[0][0] == {"user_name": "ci-deploy-bot"}
+
+
+def test_grant_purpose_uses_logical_name_for_autonamed_policy(fake):
+    fake.score = 0.2
+    pol = doc({"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "*"})
+    run(policies.iam_grant_matches_stated_purpose, "aws:iam/policy:Policy", {"name": "read-metrics-3451220", "policy": pol}, name="read-metrics")
+    assert fake.calls[0][0]["policy_name"] == "read-metrics"
